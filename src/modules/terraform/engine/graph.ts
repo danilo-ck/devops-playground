@@ -1,11 +1,16 @@
 import type { Body, Expr } from './parser';
-import type { Config, Diagnostic } from './config';
+import { moduleConfigs, type Config, type Diagnostic } from './config';
 import { providerOf, suggest } from './providers';
 
 export type NodeKind = 'variable' | 'local' | 'resource' | 'data' | 'output';
 
 export interface GraphNode {
+  /** Id único en todo el árbol: module.red.aws_vpc.this */
   id: string;
+  /** Id dentro de su módulo: aws_vpc.this, var.cidr, output.vpc_id… */
+  key: string;
+  /** Módulo al que pertenece (module.red), o undefined en la raíz. */
+  module?: string;
   kind: NodeKind;
   /** Texto corto para mostrar (nombre). */
   label: string;
@@ -75,6 +80,12 @@ export function exprRefs(e: Expr, bound: Set<string> = new Set(), out: Ref[] = [
         if (second && !second.startsWith('[')) out.push({ ref: `data.${first}.${second}`, line: e.line });
         return out;
       }
+      if (root === 'module') {
+        // module.red.vpc_id → referencia a un output concreto del módulo
+        const second = names[1];
+        out.push({ ref: second && !second.startsWith('[') ? `module.${first}.${second}` : `module.${first}`, line: e.line });
+        return out;
+      }
       out.push({ ref: `${root}.${first}`, line: e.line });
       return out;
     }
@@ -118,95 +129,155 @@ export function bodyRefs(body: Body, out: Ref[] = []): Ref[] {
   return out;
 }
 
-export function buildGraph(cfg: Config): DepGraph {
+/** Prefijo de módulo de un nodo: '' en la raíz, 'module.red.' en un hijo. */
+export const nodePrefix = (n: GraphNode) => (n.module ? `${n.module}.` : '');
+
+/**
+ * Construye el grafo de dependencias de todo el árbol de módulos. Los nodos de un
+ * módulo hijo llevan su prefijo: module.red.var.cidr, module.red.aws_vpc.this,
+ * module.red.output.vpc_id. Las variables de un hijo dependen de las expresiones
+ * que el padre escribe en el bloque module.
+ */
+export function buildGraph(root: Config): DepGraph {
   const nodes: Record<string, GraphNode> = {};
   const deps: Record<string, string[]> = {};
   const diagnostics: Diagnostic[] = [];
+  const configs = moduleConfigs(root);
 
-  for (const v of Object.values(cfg.variables))
-    nodes[`var.${v.name}`] = { id: `var.${v.name}`, kind: 'variable', label: v.name, file: v.file, line: v.line };
-  for (const l of Object.values(cfg.locals))
-    nodes[`local.${l.name}`] = { id: `local.${l.name}`, kind: 'local', label: l.name, file: l.file, line: l.line };
-  for (const r of Object.values(cfg.resources))
-    nodes[r.addr] = {
-      id: r.addr,
-      kind: r.mode === 'managed' ? 'resource' : 'data',
-      label: r.name,
-      type: r.type,
-      file: r.file,
-      line: r.line,
-      multi: r.count ? 'count' : r.forEach ? 'for_each' : undefined,
+  // ---------------------------------------------------------- nodos
+  for (const [prefix, cfg] of Object.entries(configs)) {
+    const module = prefix ? prefix.slice(0, -1) : undefined;
+    const add = (local: string, n: Omit<GraphNode, 'id' | 'key' | 'module'>) => {
+      nodes[prefix + local] = { ...n, id: prefix + local, key: local, module };
     };
-  for (const o of Object.values(cfg.outputs))
-    nodes[`output.${o.name}`] = { id: `output.${o.name}`, kind: 'output', label: o.name, file: o.file, line: o.line };
+    for (const v of Object.values(cfg.variables)) add(`var.${v.name}`, { kind: 'variable', label: v.name, file: v.file, line: v.line });
+    for (const l of Object.values(cfg.locals)) add(`local.${l.name}`, { kind: 'local', label: l.name, file: l.file, line: l.line });
+    for (const r of Object.values(cfg.resources))
+      add(r.addr, {
+        kind: r.mode === 'managed' ? 'resource' : 'data',
+        label: r.name,
+        type: r.type,
+        file: r.file,
+        line: r.line,
+        multi: r.count ? 'count' : r.forEach ? 'for_each' : undefined,
+      });
+    for (const o of Object.values(cfg.outputs)) add(`output.${o.name}`, { kind: 'output', label: o.name, file: o.file, line: o.line });
+  }
 
-  const resourceAddrs = Object.keys(cfg.resources);
-  const addDeps = (id: string, refs: Ref[], file: string) => {
-    const set = new Set<string>();
-    for (const { ref, line } of refs) {
-      if (nodes[ref]) {
-        if (ref === id) {
-          diagnostics.push({
-            severity: 'error',
-            summary: 'Self-referential block',
-            detail: `Configuration for ${id} may not refer to itself.`,
-            hint: 'Un recurso no puede usar sus propios atributos en su configuración.',
-            file,
-            line,
-          });
-          continue;
-        }
-        set.add(ref);
-        continue;
+  const subtree = (modPrefix: string) => Object.keys(nodes).filter((id) => id.startsWith(modPrefix));
+
+  /** Traduce una referencia escrita en el módulo `prefix` a ids de nodos. */
+  const resolve = (prefix: string, ref: string, line: number, file: string, from: string): string[] => {
+    const cfg = configs[prefix];
+    if (ref.startsWith('module.')) {
+      const [, name, out] = ref.split('.');
+      const child = cfg.children[name];
+      if (!child) {
+        const s = suggest(name, Object.keys(cfg.moduleCalls));
+        diagnostics.push({
+          severity: 'error',
+          summary: 'Reference to undeclared module',
+          detail: `No module call named "${name}" is declared in ${prefix ? prefix.slice(0, -1) : 'the root module'}.`,
+          hint: s ? `¿Querías referirte a module.${s}?` : `Declara antes el módulo con: module "${name}" { source = "..." }`,
+          file,
+          line,
+        });
+        return [];
       }
-      if (ref.startsWith('var.')) {
-        const name = ref.slice(4);
-        diagnostics.push({
-          severity: 'error',
-          summary: 'Reference to undeclared input variable',
-          detail: `An input variable with the name "${name}" has not been declared.`,
-          hint: `Declara la variable con: variable "${name}" { ... }`,
-          file,
-          line,
-        });
-      } else if (ref.startsWith('local.')) {
-        const name = ref.slice(6);
-        diagnostics.push({
-          severity: 'error',
-          summary: 'Reference to undeclared local value',
-          detail: `A local value with the name "${name}" has not been declared.`,
-          hint: `Defínelo dentro de un bloque locals { ${name} = ... }`,
-          file,
-          line,
-        });
-      } else if (ref.startsWith('module.')) {
-        diagnostics.push({ severity: 'error', summary: 'Reference to undeclared module', detail: `No module call named "${ref.slice(7)}" is declared.`, file, line });
-      } else {
-        const s = suggest(ref, resourceAddrs);
-        const [type, name] = ref.startsWith('data.') ? ref.slice(5).split('.') : ref.split('.');
-        diagnostics.push({
-          severity: 'error',
-          summary: 'Reference to undeclared resource',
-          detail: `A ${ref.startsWith('data.') ? 'data' : 'managed'} resource "${type}" "${name}" has not been declared in the root module.`,
-          hint: s ? `¿Querías referirte a ${s}?` : `No existe ningún recurso "${ref}". Comprueba el tipo y el nombre.`,
-          file,
-          line,
-        });
-      }
+      if (out === undefined) return subtree(`${prefix}module.${name}.`).filter((id) => nodes[id].module === `${prefix}module.${name}` && nodes[id].kind !== 'variable');
+      const id = `${prefix}module.${name}.output.${out}`;
+      if (nodes[id]) return [id];
+      const outs = Object.keys(child.outputs);
+      const s = suggest(out, outs);
+      diagnostics.push({
+        severity: 'error',
+        summary: 'Unsupported attribute',
+        detail: `This object does not have an attribute named "${out}".`,
+        hint: `El módulo "${name}" solo expone sus outputs${outs.length ? `: ${outs.join(', ')}` : ' (y no tiene ninguno)'}.${s ? ` ¿Querías decir "${s}"?` : ''} Desde fuera no se puede acceder a sus recursos ni variables.`,
+        file,
+        line,
+      });
+      return [];
     }
+    const id = prefix + ref;
+    if (nodes[id]) {
+      if (id === from) {
+        diagnostics.push({ severity: 'error', summary: 'Self-referential block', detail: `Configuration for ${id} may not refer to itself.`, hint: 'Un recurso no puede usar sus propios atributos en su configuración.', file, line });
+        return [];
+      }
+      return [id];
+    }
+    const where = prefix ? ` (dentro del módulo ${prefix.slice(0, -1)})` : '';
+    if (ref.startsWith('var.')) {
+      const name = ref.slice(4);
+      diagnostics.push({
+        severity: 'error',
+        summary: 'Reference to undeclared input variable',
+        detail: `An input variable with the name "${name}" has not been declared.`,
+        hint: prefix
+          ? `Cada módulo tiene su propio ámbito: declara variable "${name}" en los ficheros del módulo y pásale el valor desde el bloque module.`
+          : `Declara la variable con: variable "${name}" { ... }`,
+        file,
+        line,
+      });
+    } else if (ref.startsWith('local.')) {
+      diagnostics.push({ severity: 'error', summary: 'Reference to undeclared local value', detail: `A local value with the name "${ref.slice(6)}" has not been declared${where}.`, hint: `Defínelo dentro de un bloque locals { ${ref.slice(6)} = ... }${where}.`, file, line });
+    } else {
+      const s = suggest(ref, Object.keys(cfg.resources));
+      const [type, name] = ref.startsWith('data.') ? ref.slice(5).split('.') : ref.split('.');
+      const elsewhere = Object.entries(configs).find(([p, c]) => p !== prefix && c.resources[ref]);
+      diagnostics.push({
+        severity: 'error',
+        summary: 'Reference to undeclared resource',
+        detail: `A ${ref.startsWith('data.') ? 'data' : 'managed'} resource "${type}" "${name}" has not been declared in ${prefix ? prefix.slice(0, -1) : 'the root module'}.`,
+        hint: elsewhere
+          ? `${ref} existe, pero dentro de ${elsewhere[0] ? elsewhere[0].slice(0, -1) : 'el módulo raíz'}. Los recursos de otro módulo no se ven: expón el valor con un output y úsalo como module.<nombre>.<output>.`
+          : s
+            ? `¿Querías referirte a ${s}?`
+            : `No existe ningún recurso "${ref}". Comprueba el tipo y el nombre.`,
+        file,
+        line,
+      });
+    }
+    return [];
+  };
+
+  const setDeps = (id: string, prefix: string, refs: Ref[], file: string, extra: string[] = []) => {
+    const set = new Set(extra);
+    for (const { ref, line } of refs) for (const d of resolve(prefix, ref, line, file, id)) set.add(d);
+    set.delete(id);
     deps[id] = [...set].sort();
   };
 
-  for (const v of Object.values(cfg.variables)) deps[`var.${v.name}`] = [];
-  for (const l of Object.values(cfg.locals)) addDeps(`local.${l.name}`, exprRefs(l.expr), l.file);
-  for (const r of Object.values(cfg.resources)) {
-    const refs = bodyRefs(r.body);
-    // Un recurso depende también de la configuración de su proveedor (p.ej. region = var.region).
-    for (const p of cfg.providers) if (p.name === providerOf(r.type)) bodyRefs(p.body, refs);
-    for (const d of r.dependsOn) refs.push({ ref: d, line: r.line });
-    addDeps(r.addr, refs, r.file);
-  }
-  for (const o of Object.values(cfg.outputs)) addDeps(`output.${o.name}`, exprRefs(o.value), o.file);
+  // ---------------------------------------------------------- dependencias
+  // Todo recurso depende de la configuración de su proveedor (p.ej. region = var.region),
+  // que se declara en el módulo raíz y la heredan los hijos.
+  const providerDeps: Record<string, string[]> = {};
+  for (const p of root.providers)
+    providerDeps[p.name] = [...(providerDeps[p.name] ?? []), ...bodyRefs(p.body).flatMap((r) => resolve('', r.ref, r.line, p.file, `provider.${p.name}`))];
+
+  const visit =(cfg: Config, inherited: string[]) => {
+    const prefix = cfg.prefix;
+    for (const v of Object.values(cfg.variables)) deps[`${prefix}var.${v.name}`] = [];
+    for (const l of Object.values(cfg.locals)) setDeps(`${prefix}local.${l.name}`, prefix, exprRefs(l.expr), l.file);
+    for (const r of Object.values(cfg.resources)) {
+      const refs = bodyRefs(r.body);
+      for (const d of r.dependsOn) refs.push({ ref: d, line: r.line });
+      setDeps(prefix + r.addr, prefix, refs, r.file, [...inherited, ...(providerDeps[providerOf(r.type)] ?? [])]);
+    }
+    for (const o of Object.values(cfg.outputs)) setDeps(`${prefix}output.${o.name}`, prefix, exprRefs(o.value), o.file);
+    for (const call of Object.values(cfg.moduleCalls)) {
+      const child = cfg.children[call.name];
+      if (!child) continue;
+      const callDeps = call.dependsOn.flatMap((d) => resolve(prefix, d, call.line, call.file, call.id));
+      for (const v of Object.values(child.variables)) {
+        const arg = call.args.find((a) => a.name === v.name);
+        setDeps(`${child.prefix}var.${v.name}`, prefix, arg ? exprRefs(arg.expr) : [], call.file, callDeps);
+      }
+      visit(child, [...inherited, ...callDeps]);
+    }
+  };
+  visit(root, []);
 
   // Orden topológico (Kahn) determinista.
   const indeg: Record<string, number> = {};
@@ -241,6 +312,7 @@ export function buildGraph(cfg: Config): DepGraph {
   }
   return { nodes, deps, order, diagnostics };
 }
+
 
 /** Recursos (managed/data) de los que depende un nodo, atravesando variables y locals. */
 export function resourceDependencies(g: DepGraph, id: string): string[] {

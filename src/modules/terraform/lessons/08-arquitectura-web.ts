@@ -1,7 +1,7 @@
 import type { ValueMap } from '../engine';
 import { instancesOf, type TerraformLesson } from './types';
 
-export const lesson07: TerraformLesson = {
+export const lesson08: TerraformLesson = {
   id: 'arquitectura-web',
   title: 'Proyecto: un servidor web público',
   summary: 'Junta todo lo aprendido: Internet Gateway, rutas, security groups, data sources y outputs para publicar una web.',

@@ -99,7 +99,8 @@ export function TerraformLessonView({ moduleId, lessonId }: LessonViewProps) {
               return (
                 <div key={f} className={`file-tab ${f === ws.activeFile ? 'active' : ''}`} onClick={() => ws.setActiveFile(f)}>
                   <span className="file-ico">{f.endsWith('.tfvars') ? '⚙' : '◆'}</span>
-                  {f}
+                  {f.includes('/') && <span className="file-dir">{f.slice(0, f.lastIndexOf('/') + 1)}</span>}
+                  {f.includes('/') ? f.slice(f.lastIndexOf('/') + 1) : f}
                   {fe > 0 && <span className="file-err">{fe}</span>}
                   {!starterFiles.includes(f) && (
                     <button
@@ -120,7 +121,7 @@ export function TerraformLessonView({ moduleId, lessonId }: LessonViewProps) {
               <input
                 className="file-new-input"
                 autoFocus
-                placeholder="nombre.tf"
+                placeholder="main.tf o modules/red/main.tf"
                 value={newFile}
                 onChange={(e) => setNewFile(e.target.value)}
                 onKeyDown={(e) => {

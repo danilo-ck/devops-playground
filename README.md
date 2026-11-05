@@ -15,7 +15,7 @@ npm run build      # build de producción en dist/
 
 ## Qué incluye el módulo de Terraform
 
-- **Motor de Terraform simulado** (`src/modules/terraform/engine`): lexer y parser de HCL, validación contra esquemas de proveedor, grafo de dependencias, `plan` / `apply` / `destroy` con valores `(known after apply)`, update in‑place vs replace (incluido el efecto dominó), `count`, `for_each`, `locals`, `data`, `lifecycle`, variables (`default`, `terraform.tfvars`, `-var`, `validation`), outputs, más de 40 funciones (`cidrsubnet`, `merge`, `format`…), errores de la "API" de la nube durante el apply (con apply parcial) y un estado tipo `terraform.tfstate`.
+- **Motor de Terraform simulado** (`src/modules/terraform/engine`): lexer y parser de HCL, validación contra esquemas de proveedor, grafo de dependencias, `plan` / `apply` / `destroy` con valores `(known after apply)`, update in‑place vs replace (incluido el efecto dominó), `count`, `for_each`, `locals`, `data`, `lifecycle`, **módulos** (locales y de un registro simulado `devopslab/…` con versiones semánticas, ámbito propio por módulo, instalación con `terraform init` / `init -upgrade`), variables (`default`, `terraform.tfvars`, `-var`, `validation`), outputs, más de 40 funciones (`cidrsubnet`, `merge`, `format`…), errores de la "API" de la nube durante el apply (con apply parcial) y un estado tipo `terraform.tfstate`.
 - **Terminal** con `init`, `validate`, `plan`, `apply` (pide `yes`), `destroy`, `output`, `state list|show|rm`, `show`, `graph` y `console`. Los errores imitan los de Terraform e incluyen una pista didáctica en español (💡).
 - **Visualizaciones**:
   - *Infraestructura*: diagrama de la nube (región → VPC → subredes → instancias, IGW, rutas, security groups, servicios). Muestra el plan como borrador (crear / modificar / reemplazar / destruir) y anima el apply recurso a recurso.
@@ -23,7 +23,7 @@ npm run build      # build de producción en dist/
   - *Plan*: diff visual de atributos, con lo que "fuerza reemplazo".
   - *Estado*: el `terraform.tfstate` en tarjetas o en JSON.
   - *Docs*: referencia de recursos y funciones disponibles.
-- **8 lecciones** con teoría, objetivos que se validan solos, pistas y solución, más un **sandbox** libre. El progreso y el trabajo se guardan en `localStorage`.
+- **9 lecciones** con teoría, objetivos que se validan solos, pistas y solución, más un **sandbox** libre. El progreso y el trabajo se guardan en `localStorage`.
 
 ## Arquitectura
 
@@ -58,6 +58,10 @@ La home, la navegación, las rutas (`/m/:moduleId/:lessonId`), el progreso y el 
 ### Añadir una lección de Terraform
 
 Crea un fichero en `src/modules/terraform/lessons/` exportando un `TerraformLesson` (teoría, ficheros iniciales, `setup` opcional con infraestructura ya desplegada, objetivos, pistas y solución) y añádelo a `lessons/index.ts`. El test `lessons.test.ts` comprueba automáticamente que la solución se aplica y cumple los objetivos.
+
+### Añadir un módulo al registro simulado
+
+Añade una entrada en `engine/registry.ts` con su `source` (`devopslab/<nombre>/<proveedor>`) y los ficheros de cada versión. Aparece automáticamente en **Docs → Módulos** y se puede usar con `source` + `version`.
 
 ### Añadir un tipo de recurso
 

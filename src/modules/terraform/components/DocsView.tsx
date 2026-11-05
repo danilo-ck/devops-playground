@@ -1,11 +1,11 @@
 import { useMemo, useState } from 'react';
-import { DATA_SCHEMAS, FUNCTIONS, RESOURCE_SCHEMAS, type ResourceSchema } from '../engine';
+import { compareVersions, DATA_SCHEMAS, FUNCTIONS, loadConfig, REGISTRY, RESOURCE_SCHEMAS, type RegistryModule, type ResourceSchema } from '../engine';
 import { CATEGORY_COLOR, ResIcon } from './icons';
 
-/** Referencia rápida de recursos, data sources y funciones del simulador. */
+/** Referencia rápida de recursos, data sources, funciones y módulos del registro. */
 export function DocsView() {
   const [q, setQ] = useState('');
-  const [tab, setTab] = useState<'resources' | 'functions'>('resources');
+  const [tab, setTab] = useState<'resources' | 'functions' | 'modules'>('resources');
   const query = q.trim().toLowerCase();
 
   const schemas = useMemo(
@@ -27,10 +27,25 @@ export function DocsView() {
           <button className={tab === 'functions' ? 'active' : ''} onClick={() => setTab('functions')}>
             Funciones
           </button>
+          <button className={tab === 'modules' ? 'active' : ''} onClick={() => setTab('modules')}>
+            Módulos
+          </button>
         </div>
         <input className="input" placeholder="Buscar…" value={q} onChange={(e) => setQ(e.target.value)} />
       </div>
-      {tab === 'resources' ? (
+      {tab === 'modules' ? (
+        <div className="docs-list">
+          <p className="muted small">
+            Registro de módulos simulado (equivale a registry.terraform.io). Úsalos con <code>source = "devopslab/…"</code> y fija
+            la versión con <code>version</code>.
+          </p>
+          {Object.values(REGISTRY)
+            .filter((m) => !query || m.source.includes(query) || m.description.toLowerCase().includes(query))
+            .map((m) => (
+              <RegistryDoc key={m.source} m={m} />
+            ))}
+        </div>
+      ) : tab === 'resources' ? (
         <div className="docs-list">
           {schemas.map((s) => (
             <SchemaDoc key={s.mode + s.type} s={s} />
@@ -46,6 +61,53 @@ export function DocsView() {
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+function RegistryDoc({ m }: { m: RegistryModule }) {
+  const versions = Object.keys(m.versions).sort(compareVersions);
+  const [v, setV] = useState(versions[versions.length - 1]);
+  const cfg = useMemo(() => loadConfig(m.versions[v]), [m, v]);
+  const vars = Object.values(cfg.variables);
+  const required = vars.filter((x) => !x.default);
+  const example = [
+    'module "ejemplo" {',
+    `  source  = "${m.source}"`,
+    `  version = "~> ${v.split('.').slice(0, 2).join('.')}"`,
+    ...required.map((x) => `  ${x.name} = ...`),
+    '}',
+  ].join('\n');
+  return (
+    <div className="reg-module">
+      <h4>
+        📦 <code>{m.source}</code>
+      </h4>
+      <p className="small muted">{m.description}</p>
+      <div className="reg-versions">
+        {versions.map((x) => (
+          <button key={x} className={x === v ? 'active' : ''} onClick={() => setV(x)}>
+            {x}
+          </button>
+        ))}
+      </div>
+      <table className="args">
+        <tbody>
+          {vars.map((x) => (
+            <tr key={x.name}>
+              <td>
+                <code>{x.name}</code>
+              </td>
+              <td className="small">{x.default ? <span className="muted">opcional</span> : <span className="req">obligatorio</span>}</td>
+              <td className="small muted">{x.description}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="small muted">
+        Outputs: <code>{Object.keys(cfg.outputs).join(', ')}</code>
+      </p>
+      <pre className="md-code small">{example}</pre>
     </div>
   );
 }

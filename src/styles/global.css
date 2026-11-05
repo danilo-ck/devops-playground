@@ -38,6 +38,7 @@
   --c-var: #c297ff;
   --c-local: #e3b341;
   --c-output: #ff7eb6;
+  --c-module: #2dd4bf;
   --edge: #4a5a85;
 
   --radius: 10px;
@@ -2498,4 +2499,67 @@ h4 {
 
 .graph-tools {
   margin-left: auto;
+}
+
+/* ---------------------------------------------------------------- módulos */
+.gnode-module .gnode-box {
+  fill: #0f2422;
+  stroke: var(--c-module);
+  stroke-width: 1.6;
+}
+.gnode-module {
+  cursor: zoom-in;
+}
+.gnode-in-module .gnode-box {
+  stroke-dasharray: 2 0;
+  fill: #10192e;
+}
+.mod-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25em;
+  font-size: 0.66em;
+  font-family: var(--mono);
+  color: var(--c-module);
+  border: 1px solid rgba(45, 212, 191, 0.45);
+  background: rgba(45, 212, 191, 0.08);
+  border-radius: 4px;
+  padding: 0 0.4em;
+  white-space: nowrap;
+}
+.file-dir {
+  color: var(--muted);
+  opacity: 0.8;
+}
+.reg-module {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--c-module);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  padding: 0.6em 0.8em;
+}
+.reg-module h4 {
+  margin: 0 0 0.2em;
+  font-size: 0.9em;
+}
+.reg-versions {
+  display: flex;
+  gap: 0.35em;
+  flex-wrap: wrap;
+  margin: 0.4em 0;
+}
+.reg-versions button {
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 0.74em;
+  border: 1px solid var(--border-2);
+  background: transparent;
+  color: var(--text-2);
+  border-radius: 99px;
+  padding: 0.05em 0.6em;
+  cursor: pointer;
+}
+.reg-versions button.active {
+  border-color: var(--c-module);
+  color: var(--c-module);
 }

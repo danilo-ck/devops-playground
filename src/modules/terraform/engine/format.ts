@@ -1,4 +1,4 @@
-import type { Diagnostic } from './config';
+import { findResource, type Diagnostic } from './config';
 import type { ApplyEvent, PlanResult, ResourceChange } from './evaluate';
 import type { InstanceState, TfState } from './state';
 import { formatHcl, isMap, isUnknown, type Value, type ValueMap } from './values';
@@ -150,7 +150,7 @@ export function renderPlan(p: PlanResult): TermLine[] {
   const used = new Set(actionable.map((c) => c.action));
   for (const a of ['create', 'update', 'replace', 'delete', 'read']) if (used.has(a as never)) out.push(L(`${SYMBOL[a].sym} ${SYMBOL[a].legend}`, SYMBOL[a].tone));
   out.push(L(''), L('Terraform will perform the following actions:'));
-  const cfgHas = (addr: string) => !!p.config.resources[addr] && !p.destroy;
+  const cfgHas = (addr: string) => !!findResource(p.config, addr) && !p.destroy;
   for (const c of actionable) out.push(...changeBlock(c, cfgHas));
   out.push(L(''), L(`Plan: ${p.summary.add} to add, ${p.summary.change} to change, ${p.summary.destroy} to destroy.`, 'bold'));
   out.push(...renderOutputChanges(p));

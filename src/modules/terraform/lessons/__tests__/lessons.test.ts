@@ -44,6 +44,7 @@ describe('lecciones de Terraform', () => {
               { command: 'plan', ok: true, at: 2, summary: r.summary },
               { command: 'apply', ok: true, at: 3, summary: r.summary, actions: ['create', 'update', 'replace'] as never },
               { command: 'console-eval', ok: true, at: 4 },
+              { command: 'state list', ok: true, at: 5 },
             ],
           };
           const failing = lesson.objectives.filter((o) => !o.check(ctx)).map((o) => o.id);

@@ -1,5 +1,6 @@
-import { parseHcl, type Body, type Expr } from './parser';
+import { parseHcl, type Attribute, type Body, type Expr } from './parser';
 import { getSchema, PROVIDERS, providerOf, RESOURCE_SCHEMAS, DATA_SCHEMAS, suggest, type ArgSpec } from './providers';
+import { isLocalSource, isRegistrySource, isValidConstraint, joinPath, REGISTRY, resolveVersion, satisfies } from './registry';
 
 export interface Diagnostic {
   severity: 'error' | 'warning';
@@ -60,13 +61,39 @@ export interface ProviderConfig {
   line: number;
 }
 
+export interface ModuleCallConfig {
+  /** Dirección completa de la llamada: module.network (o module.app.module.db). */
+  id: string;
+  name: string;
+  source: string;
+  /** Restricción de versión escrita por el usuario (solo registro). */
+  version?: string;
+  kind: 'local' | 'registry';
+  /** Carpeta del módulo local, relativa a la raíz del proyecto. */
+  dir?: string;
+  /** Versión del registro que se ha cargado. */
+  resolvedVersion?: string;
+  args: Attribute[];
+  dependsOn: string[];
+  file: string;
+  line: number;
+}
+
+/** Versión instalada por `terraform init` para cada llamada a módulo. */
+export type InstalledModules = Record<string, { source: string; version: string }>;
+
 export interface Config {
+  /** '' en el módulo raíz; 'module.network.' en un módulo hijo. */
+  prefix: string;
   resources: Record<string, ResourceConfig>;
   variables: Record<string, VariableConfig>;
   locals: Record<string, LocalConfig>;
   outputs: Record<string, OutputConfig>;
   providers: ProviderConfig[];
   requiredProviders: Record<string, { source?: string; version?: string }>;
+  moduleCalls: Record<string, ModuleCallConfig>;
+  children: Record<string, Config>;
+  /** En el módulo raíz incluye también los diagnósticos de todos los hijos. */
   diagnostics: Diagnostic[];
 }
 
@@ -162,17 +189,39 @@ function validateArgs(
   }
 }
 
-export function loadConfig(files: Record<string, string>): Config {
+const dirOf = (path: string) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
+
+interface LoadCtx {
+  allFiles: Record<string, string>;
+  installed: InstalledModules;
+  diags: Diagnostic[];
+}
+
+/**
+ * Carga la configuración del módulo raíz (ficheros .tf sin carpeta) y, de forma
+ * recursiva, la de los módulos que llama (carpetas locales o registro simulado).
+ */
+export function loadConfig(files: Record<string, string>, installed: InstalledModules = {}): Config {
+  const ctx: LoadCtx = { allFiles: files, installed, diags: [] };
+  const rootFiles = Object.fromEntries(Object.entries(files).filter(([f]) => !f.includes('/')));
+  return loadModule(rootFiles, ctx, '', '', 0);
+}
+
+function loadModule(files: Record<string, string>, ctx: LoadCtx, prefix: string, dir: string, depth: number): Config {
   const cfg: Config = {
+    prefix,
     resources: {},
     variables: {},
     locals: {},
     outputs: {},
     providers: [],
     requiredProviders: {},
-    diagnostics: [],
+    moduleCalls: {},
+    children: {},
+    diagnostics: ctx.diags,
   };
-  const diags = cfg.diagnostics;
+  const diags = ctx.diags;
+  const pendingCalls: ModuleCallConfig[] = [];
 
   for (const [file, src] of Object.entries(files)) {
     if (!file.endsWith('.tf')) continue;
@@ -401,23 +450,60 @@ export function loadConfig(files: Record<string, string>): Config {
           };
           break;
         }
-        case 'module':
-          diags.push({
-            severity: 'error',
-            summary: 'Modules not supported yet',
-            detail: 'Los bloques module todavía no están disponibles en este simulador.',
-            hint: 'Los módulos llegarán en una próxima lección. De momento declara los recursos directamente.',
+        case 'module': {
+          if (!need(1, 'module "nombre" { source = "./modules/red" }')) break;
+          const name = b.labels[0];
+          if (cfg.moduleCalls[name] || pendingCalls.some((c) => c.name === name)) {
+            diags.push({ severity: 'error', summary: 'Duplicate module call', detail: `A module call named "${name}" was already defined.`, hint: 'Cada llamada a un módulo necesita un nombre distinto.', file, line: b.line });
+            break;
+          }
+          const srcAttr = attr('source');
+          const source = literalString(srcAttr?.expr);
+          if (!srcAttr) {
+            diags.push({ severity: 'error', summary: 'Missing required argument', detail: 'The argument "source" is required, but no definition was found.', hint: 'Todo módulo necesita source: una ruta local ("./modules/red") o una dirección del registro ("devopslab/vpc/aws").', file, line: b.line });
+            break;
+          }
+          if (source === undefined) {
+            diags.push({ severity: 'error', summary: 'Variables not allowed', detail: 'Variables may not be used here.', hint: 'source debe ser un texto fijo: Terraform necesita conocerlo en "terraform init", antes de evaluar variables.', file, line: srcAttr.line });
+            break;
+          }
+          const verAttr = attr('version');
+          const version = literalString(verAttr?.expr);
+          for (const meta of ['count', 'for_each']) {
+            if (attr(meta)) {
+              diags.push({ severity: 'error', summary: `"${meta}" on modules not supported yet`, detail: `El simulador todavía no admite ${meta} en bloques module.`, hint: `En Terraform real sí puedes usar ${meta} en un module para crear varias copias del módulo.`, file, line: attr(meta)!.line });
+            }
+          }
+          const dependsOn: string[] = [];
+          const dep = attr('depends_on');
+          if (dep?.expr.kind === 'tuple') for (const item of dep.expr.items) {
+            const ref = traversalToAddr(item);
+            if (ref) dependsOn.push(ref);
+          }
+          const reserved = new Set(['source', 'version', 'count', 'for_each', 'depends_on', 'providers']);
+          pendingCalls.push({
+            id: `${prefix}module.${name}`,
+            name,
+            source,
+            version,
+            kind: isLocalSource(source) ? 'local' : 'registry',
+            args: b.body.attributes.filter((a) => !reserved.has(a.name)),
+            dependsOn,
             file,
-            line: b.line,
+            line: verAttr?.line ?? b.line,
           });
+          if (version !== undefined && !isValidConstraint(version)) {
+            diags.push({ severity: 'error', summary: 'Invalid version constraint', detail: `"${version}" is not a valid version constraint.`, hint: 'Ejemplos válidos: "1.2.0", "~> 1.2", ">= 1.0, < 2.0".', file, line: verAttr!.line });
+          }
           break;
+        }
         default: {
-          const s = suggest(b.type, ['resource', 'variable', 'output', 'locals', 'provider', 'terraform', 'data']);
+          const s = suggest(b.type, ['resource', 'variable', 'output', 'locals', 'provider', 'terraform', 'data', 'module']);
           diags.push({
             severity: 'error',
             summary: 'Unsupported block type',
             detail: `Blocks of type "${b.type}" are not expected here.${s ? ` Did you mean "${s}"?` : ''}`,
-            hint: s ? `¿Querías escribir "${s}"?` : 'Bloques válidos: terraform, provider, resource, data, variable, locals, output.',
+            hint: s ? `¿Querías escribir "${s}"?` : 'Bloques válidos: terraform, provider, resource, data, variable, locals, output, module.',
             file,
             line: b.line,
           });
@@ -425,15 +511,134 @@ export function loadConfig(files: Record<string, string>): Config {
       }
     }
   }
+
+  for (const call of pendingCalls) loadChild(cfg, call, ctx, dir, depth);
   return cfg;
+}
+
+/** Resuelve el source de una llamada a módulo, carga el hijo y valida sus argumentos. */
+function loadChild(parent: Config, call: ModuleCallConfig, ctx: LoadCtx, dir: string, depth: number) {
+  const diags = ctx.diags;
+  const err = (summary: string, detail: string, hint: string) => diags.push({ severity: 'error', summary, detail, hint, file: call.file, line: call.line });
+  parent.moduleCalls[call.name] = call;
+  if (depth >= 4) return err('Module nesting too deep', 'Too many levels of nested modules.', 'El simulador admite como máximo 4 niveles de módulos anidados.');
+
+  let childFiles: Record<string, string>;
+  let childDir = '';
+  if (call.kind === 'local') {
+    if (call.version !== undefined) {
+      return err('Invalid version constraint', `Cannot apply a version constraint to module "${call.name}" because it has a relative local path.`, 'version solo tiene sentido en módulos del registro: un módulo local siempre usa el código que hay en la carpeta.');
+    }
+    const resolved = joinPath(dir, call.source);
+    if (resolved === null) return err('Invalid module source', `The path "${call.source}" leaves the project directory.`, 'La ruta del módulo debe quedar dentro del proyecto.');
+    childDir = resolved;
+    call.dir = resolved;
+    childFiles = Object.fromEntries(Object.entries(ctx.allFiles).filter(([f]) => f.endsWith('.tf') && dirOf(f) === resolved));
+    if (!Object.keys(childFiles).length) {
+      return err(
+        'Unreadable module directory',
+        `Unable to evaluate directory symlink: lstat ${call.source}: no such file or directory`,
+        `No hay ficheros .tf en "${resolved}". Crea por ejemplo ${resolved}/main.tf con el botón + del editor, o revisa la ruta.`,
+      );
+    }
+  } else if (isRegistrySource(call.source)) {
+    const mod = REGISTRY[call.source];
+    if (!mod) {
+      return err(
+        'Module not found',
+        `Could not find module "${call.source}" in registry.terraform.io.`,
+        `Módulos disponibles en el registro simulado: ${Object.keys(REGISTRY).join(', ')} (pestaña Docs → Módulos).`,
+      );
+    }
+    const versions = Object.keys(mod.versions);
+    const inst = ctx.installed[call.id];
+    const usable = inst && inst.source === call.source && versions.includes(inst.version) && (!call.version || satisfies(inst.version, call.version));
+    const v = usable ? inst!.version : resolveVersion(versions, call.version);
+    if (!v) {
+      return err(
+        'Unresolvable module version constraint',
+        `There is no available version of module "${call.source}" which matches the given version constraint "${call.version}".`,
+        `Versiones publicadas: ${versions.join(', ')}.`,
+      );
+    }
+    call.resolvedVersion = v;
+    const shortName = call.id.replace(/^module\./, '').replace(/\.module\./g, '.');
+    childFiles = Object.fromEntries(Object.entries(mod.versions[v]).map(([f, src]) => [`.terraform/modules/${shortName}/${f}`, src]));
+  } else {
+    return err(
+      'Module source not supported',
+      `El simulador no puede descargar módulos desde "${call.source}".`,
+      'En Terraform real también se usan fuentes como "github.com/org/repo", "git::https://…" o "s3::…". Aquí usa una ruta local ("./modules/…") o el registro simulado ("devopslab/vpc/aws").',
+    );
+  }
+
+  const child = loadModule(childFiles, ctx, `${call.id}.`, childDir, depth + 1);
+  parent.children[call.name] = child;
+
+  const declared = Object.keys(child.variables);
+  for (const a of call.args) {
+    if (!child.variables[a.name]) {
+      const s = suggest(a.name, declared);
+      diags.push({
+        severity: 'error',
+        summary: 'Unsupported argument',
+        detail: `An argument named "${a.name}" is not expected here.${s ? ` Did you mean "${s}"?` : ''}`,
+        hint: `El módulo "${call.name}" no declara la variable "${a.name}". ${s ? `¿Querías escribir "${s}"? ` : ''}Entradas disponibles: ${declared.join(', ') || '(ninguna)'}.`,
+        file: call.file,
+        line: a.line,
+      });
+    }
+  }
+  for (const v of Object.values(child.variables)) {
+    if (!v.default && !call.args.some((a) => a.name === v.name)) {
+      diags.push({
+        severity: 'error',
+        summary: 'Missing required argument',
+        detail: `The argument "${v.name}" is required, but no definition was found.`,
+        hint: `La variable "${v.name}" del módulo "${call.name}" no tiene valor por defecto: pásala en el bloque module (${v.name} = ...).`,
+        file: call.file,
+        line: call.line,
+      });
+    }
+  }
+}
+
+/** Todas las configuraciones del árbol, indexadas por prefijo ('' = raíz). */
+export function moduleConfigs(root: Config): Record<string, Config> {
+  const out: Record<string, Config> = {};
+  const visit = (c: Config) => {
+    out[c.prefix] = c;
+    Object.values(c.children).forEach(visit);
+  };
+  visit(root);
+  return out;
+}
+
+/** Todas las llamadas a módulos del árbol (incluidas las anidadas). */
+export function allModuleCalls(root: Config): ModuleCallConfig[] {
+  return Object.values(moduleConfigs(root)).flatMap((c) => Object.values(c.moduleCalls));
+}
+
+/** Separa "module.a.aws_vpc.x" en prefijo ("module.a.") y dirección local ("aws_vpc.x"). */
+export function splitAddr(full: string): { prefix: string; local: string } {
+  const m = /^((?:module\.[^.[\]]+\.)*)(.*)$/.exec(full)!;
+  return { prefix: m[1], local: m[2] };
+}
+
+export function findResource(root: Config, fullAddr: string): ResourceConfig | undefined {
+  const { prefix, local } = splitAddr(fullAddr);
+  return moduleConfigs(root)[prefix]?.resources[local];
 }
 
 export const hasErrors = (d: Diagnostic[]) => d.some((x) => x.severity === 'error');
 
 /** Proveedores que necesita una configuración (para `terraform init`). */
 export function requiredProviderNames(cfg: Config): string[] {
-  const names = new Set<string>(Object.keys(cfg.requiredProviders));
-  for (const p of cfg.providers) names.add(p.name);
-  for (const r of Object.values(cfg.resources)) names.add(providerOf(r.type));
+  const names = new Set<string>();
+  for (const c of Object.values(moduleConfigs(cfg))) {
+    Object.keys(c.requiredProviders).forEach((n) => names.add(n));
+    for (const p of c.providers) names.add(p.name);
+    for (const r of Object.values(c.resources)) names.add(providerOf(r.type));
+  }
   return [...names].filter((n) => PROVIDERS[n]).sort();
 }

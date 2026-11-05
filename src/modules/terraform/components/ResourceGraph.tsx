@@ -36,6 +36,7 @@ const KIND_COLOR: Record<string, string> = {
   local: 'var(--c-local)',
   output: 'var(--c-output)',
   data: 'var(--c-data)',
+  module: 'var(--c-module)',
 };
 
 const KIND_LABEL: Record<string, string> = {
@@ -44,30 +45,71 @@ const KIND_LABEL: Record<string, string> = {
   output: 'output',
 };
 
-interface LaidNode extends GraphNode {
+/** Nodo visual: un nodo del grafo o, en modo agrupado, un módulo entero. */
+interface VNode {
+  id: string;
+  kind: GraphNode['kind'] | 'module';
+  label: string;
+  type?: string;
+  file?: string;
+  line?: number;
+  multi?: GraphNode['multi'];
+  module?: string;
+  ghost?: boolean;
+  /** Para módulos agrupados: nº de recursos que contiene. */
+  members?: number;
+}
+
+interface LaidNode extends VNode {
   x: number;
   y: number;
   status: Status;
   count: number;
-  ghost?: boolean;
 }
+
+/** module.red.aws_vpc.this → module.red (módulo de primer nivel) */
+const topModule = (id: string) => (id.startsWith('module.') ? id.split('.').slice(0, 2).join('.') : null);
+const shortModule = (m: string) => m.replace(/^module\./, '').replace(/\.module\./g, ' › ');
 
 export function ResourceGraph({ graph, plan, state, active }: Props) {
   const [hover, setHover] = useState<string | null>(null);
   const [fit, setFit] = useState(false);
-  const activeRes = active ? active.replace(/\[.*\]$/, '') : null;
+  const [grouped, setGrouped] = useState(true);
+  const hasModules = !!graph && Object.values(graph.nodes).some((n) => n.module);
+  const collapse = grouped && hasModules;
+  const activeBase = active ? active.replace(/\[.*\]$/, '') : null;
+  const activeRes = activeBase && collapse ? topModule(activeBase) ?? activeBase : activeBase;
 
   const layout = useMemo(() => {
     if (!graph) return null;
-    const nodes: Record<string, GraphNode & { ghost?: boolean }> = { ...graph.nodes };
-    const deps: Record<string, string[]> = { ...graph.deps };
+    let nodes: Record<string, VNode> = { ...graph.nodes };
+    let deps: Record<string, string[]> = { ...graph.deps };
 
     // Recursos que se van a destruir porque ya no están en el código.
     for (const c of plan?.changes ?? []) {
       if (c.action === 'delete' && !nodes[c.resourceAddr]) {
-        nodes[c.resourceAddr] = { id: c.resourceAddr, kind: 'resource', label: c.name, type: c.type, ghost: true };
+        nodes[c.resourceAddr] = { id: c.resourceAddr, kind: 'resource', label: c.name, type: c.type, module: c.module, ghost: true };
         deps[c.resourceAddr] = [];
       }
+    }
+
+    // Modo agrupado: cada módulo de primer nivel se dibuja como un único nodo.
+    if (collapse) {
+      const mapId = (id: string) => topModule(id) ?? id;
+      const grouped: Record<string, VNode> = {};
+      const gdeps: Record<string, Set<string>> = {};
+      for (const n of Object.values(nodes)) {
+        const id = mapId(n.id);
+        if (id === n.id) grouped[id] = n;
+        else {
+          grouped[id] ??= { id, kind: 'module', label: id.slice(7), members: 0 };
+          if (n.kind === 'resource') grouped[id].members!++;
+        }
+        gdeps[id] ??= new Set();
+        for (const d of deps[n.id] ?? []) if (mapId(d) !== id) gdeps[id].add(mapId(d));
+      }
+      nodes = grouped;
+      deps = Object.fromEntries(Object.entries(gdeps).map(([k, v]) => [k, [...v]]));
     }
 
     const ids = Object.keys(nodes);
@@ -82,13 +124,14 @@ export function ResourceGraph({ graph, plan, state, active }: Props) {
       return layer[id];
     };
     ids.forEach(depth);
-    // Los outputs siempre en la última columna.
+    // Los outputs del módulo raíz siempre en la última columna.
+    const isRootOutput = (id: string) => nodes[id].kind === 'output' && !nodes[id].module;
     const maxLayer = Math.max(0, ...ids.map((id) => layer[id]));
-    for (const id of ids) if (nodes[id].kind === 'output') layer[id] = maxLayer + (ids.some((x) => nodes[x].kind !== 'output' && layer[x] === maxLayer) ? 1 : 0);
+    for (const id of ids) if (isRootOutput(id)) layer[id] = maxLayer + (ids.some((x) => !isRootOutput(x) && layer[x] === maxLayer) ? 1 : 0);
 
     const layers: string[][] = [];
     for (const id of ids) (layers[layer[id]] ??= []).push(id);
-    const kindOrder = { variable: 0, local: 1, data: 2, resource: 3, output: 4 };
+    const kindOrder: Record<string, number> = { variable: 0, local: 1, data: 2, module: 3, resource: 4, output: 5 };
     const pos: Record<string, number> = {};
     layers.forEach((col, li) => {
       if (!col) return;
@@ -107,10 +150,11 @@ export function ResourceGraph({ graph, plan, state, active }: Props) {
     const height = PAD * 2 + maxRows * H + (maxRows - 1) * GY;
     const width = PAD * 2 + layers.length * W + Math.max(0, layers.length - 1) * GX;
 
-    const statusOf = (n: GraphNode & { ghost?: boolean }): { status: Status; count: number } => {
-      if (n.kind !== 'resource' && n.kind !== 'data') return { status: 'none', count: 0 };
-      const ch = (plan?.changes ?? []).filter((c) => c.resourceAddr === n.id);
-      const inState = Object.values(state.resources).filter((r) => r.resourceAddr === n.id);
+    const statusOf = (n: VNode): { status: Status; count: number } => {
+      if (n.kind !== 'resource' && n.kind !== 'data' && n.kind !== 'module') return { status: 'none', count: 0 };
+      const match = n.kind === 'module' ? (addr: string) => addr.startsWith(`${n.id}.`) : (addr: string) => addr === n.id;
+      const ch = (plan?.changes ?? []).filter((c) => match(c.resourceAddr) && (n.kind !== 'module' || c.mode === 'managed'));
+      const inState = Object.values(state.resources).filter((r) => match(r.resourceAddr) && (n.kind !== 'module' || r.mode === 'managed'));
       const planned = ch.filter((c) => c.action !== 'delete').length;
       const count = plan && ch.length ? planned : inState.length;
       for (const a of ACTION_PRIORITY) if (ch.some((c) => c.action === a)) return { status: a, count };
@@ -128,7 +172,8 @@ export function ResourceGraph({ graph, plan, state, active }: Props) {
     });
     const edges = ids.flatMap((id) => (deps[id] ?? []).filter((d) => laid[d]).map((d) => ({ from: d, to: id })));
     return { laid, edges, width, height };
-  }, [graph, plan, state]);
+  }, [graph, plan, state, collapse]);
+
 
   if (!graph || !layout) {
     return (
@@ -174,8 +219,18 @@ export function ResourceGraph({ graph, plan, state, active }: Props) {
         <span>
           <i style={{ background: 'var(--c-output)' }} /> output
         </span>
+        {hasModules && (
+          <span>
+            <i style={{ background: 'var(--c-module)' }} /> módulo
+          </span>
+        )}
         <span className="muted">Flechas: de la dependencia al recurso que la usa (orden de creación →)</span>
-        <button className="link graph-tools" onClick={() => setFit((f) => !f)}>
+        {hasModules && (
+          <button className="link graph-tools" onClick={() => setGrouped((g) => !g)} title="Ver cada módulo como una caja o mostrar su contenido">
+            {grouped ? '📦 Expandir módulos' : '📦 Agrupar módulos'}
+          </button>
+        )}
+        <button className={`link ${hasModules ? '' : 'graph-tools'}`} onClick={() => setFit((f) => !f)}>
           {fit ? '🔍 Tamaño real' : '⤢ Ajustar a la vista'}
         </button>
       </div>
@@ -211,13 +266,15 @@ export function ResourceGraph({ graph, plan, state, active }: Props) {
           {Object.values(layout.laid).map((n) => {
             const schema = n.type ? RESOURCE_SCHEMAS[n.type] : undefined;
             const color = n.kind === 'resource' ? CATEGORY_COLOR[schema?.category ?? 'utility'] : KIND_COLOR[n.kind];
+            const label = n.kind === 'module' ? `module.${n.label}` : n.label;
             const isActive = activeRes === n.id;
             const dim = hover && !related.has(n.id);
             return (
               <g
                 key={n.id}
                 transform={`translate(${n.x},${n.y})`}
-                className={`gnode gnode-${n.kind} st-${n.status} ${isActive ? 'gnode-active' : ''} ${dim ? 'gnode-dim' : ''} ${n.ghost ? 'gnode-ghost' : ''}`}
+                className={`gnode gnode-${n.kind} st-${n.status} ${isActive ? 'gnode-active' : ''} ${dim ? 'gnode-dim' : ''} ${n.ghost ? 'gnode-ghost' : ''} ${n.module ? 'gnode-in-module' : ''}`}
+                onDoubleClick={() => n.kind === 'module' && setGrouped(false)}
                 onMouseEnter={() => setHover(n.id)}
                 onMouseLeave={() => setHover(null)}
               >
@@ -228,11 +285,13 @@ export function ResourceGraph({ graph, plan, state, active }: Props) {
                   <SvgIcon type={n.type} kind={n.kind} x={14} y={H / 2 - 10} size={20} />
                 </g>
                 <text x={44} y={23} className="gnode-title">
-                  {truncate(n.label, 17)}
+                  {truncate(label, 17)}
                   {n.multi && n.count > 0 ? ` ×${n.count}` : ''}
                 </text>
                 <text x={44} y={41} className="gnode-sub">
-                  {truncate(n.type ?? KIND_LABEL[n.kind] ?? n.kind, 22)}
+                  {n.kind === 'module'
+                    ? `módulo · ${n.members} recurso${n.members === 1 ? '' : 's'}`
+                    : truncate(`${n.module ? `${shortModule(n.module)} › ` : ''}${n.type ?? KIND_LABEL[n.kind] ?? n.kind}`, 24)}
                 </text>
                 {n.status !== 'none' && (
                   <g transform={`translate(${W - 10},-9)`} className={`gbadge gbadge-${n.status}`}>

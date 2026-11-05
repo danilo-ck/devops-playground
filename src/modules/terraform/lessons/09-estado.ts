@@ -24,7 +24,7 @@ resource "aws_subnet" "a" {
 }
 `;
 
-export const lesson08: TerraformLesson = {
+export const lesson09: TerraformLesson = {
   id: 'estado',
   title: 'El estado y destroy',
   summary: 'Qué es terraform.tfstate, por qué es tan importante, cómo inspeccionarlo y cómo destruir la infraestructura.',

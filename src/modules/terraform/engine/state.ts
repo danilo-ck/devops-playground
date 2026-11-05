@@ -6,6 +6,8 @@ export interface InstanceState {
   addr: string;
   /** aws_instance.web */
   resourceAddr: string;
+  /** Módulo al que pertenece (module.red) o undefined en la raíz. */
+  module?: string;
   mode: 'managed' | 'data';
   type: string;
   name: string;
@@ -64,6 +66,7 @@ export function toTfStateJson(s: TfState): unknown {
       const r = insts[0];
       const p = PROVIDERS[providerOf(r.type)];
       return {
+        ...(r.module ? { module: r.module } : {}),
         mode: r.mode,
         type: r.type,
         name: r.name,

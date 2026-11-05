@@ -9,3 +9,5 @@ export { RESOURCE_SCHEMAS, DATA_SCHEMAS, PROVIDERS, getSchema, providerOf } from
 export type { ResourceSchema, ArgSpec, Category } from './providers';
 export { FUNCTIONS } from './functions';
 export { parseHcl } from './parser';
+export { REGISTRY, satisfies, resolveVersion, compareVersions } from './registry';
+export type { RegistryModule } from './registry';

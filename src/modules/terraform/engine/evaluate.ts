@@ -1,6 +1,6 @@
-import { hasErrors, loadConfig, type Config, type Diagnostic, type ResourceConfig } from './config';
+import { findResource, hasErrors, loadConfig, moduleConfigs, type Config, type Diagnostic, type InstalledModules, type ResourceConfig } from './config';
 import { callFunction, FunctionError } from './functions';
-import { buildGraph, resourceDependencies, type DepGraph } from './graph';
+import { buildGraph, nodePrefix, resourceDependencies, type DepGraph } from './graph';
 import { parseExpressionSource, parseHcl, type Body, type Expr } from './parser';
 import { getSchema, providerOf, type ArgSpec, type GenCtx, type ResourceSchema } from './providers';
 import { cloneState, instanceAddr, type InstanceState, type TfState } from './state';
@@ -31,6 +31,8 @@ export interface AttrDiff {
 export interface ResourceChange {
   addr: string;
   resourceAddr: string;
+  /** Módulo al que pertenece (module.red) o undefined en la raíz. */
+  module?: string;
   mode: 'managed' | 'data';
   type: string;
   name: string;
@@ -85,6 +87,8 @@ export interface ApplyResult extends PlanResult {
 export interface RunOptions {
   /** Valores pasados con -var "nombre=valor". */
   cliVars?: Record<string, string>;
+  /** Versiones de módulos instaladas por terraform init. */
+  modules?: InstalledModules;
   destroy?: boolean;
 }
 
@@ -105,6 +109,8 @@ interface Scope {
   vars: ValueMap;
   locals: ValueMap;
   resources: Record<string, ValueMap>;
+  /** Outputs de los módulos hijos: module.<nombre>.<output> */
+  modules: Record<string, ValueMap>;
   data: Record<string, ValueMap>;
   count?: { index: number };
   each?: { key: Value; value: Value };
@@ -112,7 +118,7 @@ interface Scope {
   splatItem?: Value;
 }
 
-const emptyScope = (): Scope => ({ vars: {}, locals: {}, resources: {}, data: {}, bound: {} });
+const emptyScope = (): Scope => ({ vars: {}, locals: {}, resources: {}, data: {}, modules: {}, bound: {} });
 
 const toNum = (v: Value, line: number): number => {
   if (typeof v === 'number') return v;
@@ -176,6 +182,8 @@ export function evalExpr(e: Expr, s: Scope): Value {
           return { key: s.each.key, value: s.each.value };
         case 'path':
           return { module: '.', root: '.', cwd: '/workspace' };
+        case 'module':
+          return s.modules;
         case 'terraform':
           return { workspace: 'default' };
       }
@@ -451,7 +459,7 @@ function convertVar(v: Value, type: string, name: string): Value {
 function resolveVariables(cfg: Config, files: Record<string, string>, cliVars: Record<string, string>, diags: Diagnostic[]): ValueMap | null {
   const tfvars: ValueMap = {};
   for (const [file, src] of Object.entries(files)) {
-    if (!file.endsWith('.tfvars')) continue;
+    if (!file.endsWith('.tfvars') || file.includes('/')) continue;
     const { body, error } = parseHcl(src);
     if (!body) {
       diags.push({ severity: 'error', summary: 'Syntax error', detail: error!.message, hint: error!.hint, file, line: error!.line });
@@ -574,11 +582,25 @@ interface WalkResult {
   expanded: Set<string>;
   failed: boolean;
   scope: Scope;
+  scopes: Record<string, Scope>;
+}
+
+/** 'module.a.module.b.' → { parentPrefix: 'module.a.', callName: 'b' } */
+function parentOf(prefix: string) {
+  const m = /^(.*)module.([^.]+).$/.exec(prefix)!;
+  return { parentPrefix: m[1], callName: m[2] };
 }
 
 function walk(ctx: WalkContext): WalkResult {
   const { cfg, graph, cur, realize, events, diags } = ctx;
-  const scope: Scope = { ...emptyScope(), vars: ctx.vars };
+  // Un ámbito (scope) por módulo: cada módulo solo ve sus variables, locals y recursos.
+  const configs = moduleConfigs(cfg);
+  const scopes: Record<string, Scope> = {};
+  for (const [p, c] of Object.entries(configs)) {
+    scopes[p] = { ...emptyScope(), vars: p === '' ? ctx.vars : {} };
+    for (const name of Object.keys(c.moduleCalls)) scopes[p].modules[name] = {};
+  }
+  const scope = scopes[''];
   const changes: ResourceChange[] = [];
   const outputs: WalkResult['outputs'] = {};
   const expanded = new Set<string>();
@@ -613,10 +635,13 @@ function walk(ctx: WalkContext): WalkResult {
 
   const snapshot = () => cloneState(cur);
 
-  const processResource = (rc: ResourceConfig) => {
+  const processResource = (rc: ResourceConfig, prefix: string) => {
+    const scope = scopes[prefix];
+    const fullAddr = prefix + rc.addr;
+    const module = prefix ? prefix.slice(0, -1) : undefined;
     const schema = getSchema(rc.mode, rc.type)!;
     const region = providerOf(rc.type) === 'aws' ? regionOf('aws') : 'local';
-    const deps = resourceDependencies(graph, rc.addr).filter((d) => !d.startsWith('data.'));
+    const deps = resourceDependencies(graph, fullAddr).filter((d) => graph.nodes[d]?.kind !== 'data');
 
     let keys: (string | number | undefined)[] = [undefined];
     let eachValues: ValueMap = {};
@@ -666,7 +691,7 @@ function walk(ctx: WalkContext): WalkResult {
     let single: Value = null;
 
     for (const key of keys) {
-      const addr = instanceAddr(rc.addr, key);
+      const addr = instanceAddr(fullAddr, key);
       const s: Scope = {
         ...scope,
         count: typeof key === 'number' ? { index: key } : undefined,
@@ -680,7 +705,8 @@ function walk(ctx: WalkContext): WalkResult {
       const sens = sensitiveAttrs(schema);
       const base = {
         addr,
-        resourceAddr: rc.addr,
+        resourceAddr: fullAddr,
+        module,
         mode: rc.mode,
         type: rc.type,
         name: rc.name,
@@ -795,28 +821,55 @@ function walk(ctx: WalkContext): WalkResult {
 
   for (const id of graph.order) {
     const node = graph.nodes[id];
+    const prefix = nodePrefix(node);
+    const mcfg = configs[prefix];
+    const ms = scopes[prefix];
     try {
-      if (node.kind === 'local') {
-        scope.locals[node.label] = evalExpr(cfg.locals[node.label].expr, scope);
+      if (node.kind === 'variable' && prefix) {
+        // Entrada de un módulo hijo: se evalúa en el ámbito del padre.
+        const { parentPrefix, callName } = parentOf(prefix);
+        const call = configs[parentPrefix].moduleCalls[callName];
+        const v = mcfg.variables[node.label];
+        const arg = call.args.find((a) => a.name === node.label);
+        let val: Value | undefined = arg ? evalExpr(arg.expr, scopes[parentPrefix]) : v.default ? evalExpr(v.default, emptyScope()) : undefined;
+        if (val === undefined) throw new EvalError(`Missing required argument "${node.label}" for module "${callName}"`, call.line);
+        try {
+          val = convertVar(val, typeConstraint(v.type), node.label);
+        } catch (e) {
+          if (e instanceof EvalError) throw new EvalError(e.message, arg?.line ?? call.line, e.hint);
+          throw e;
+        }
+        for (const rule of v.validations) {
+          if (evalExpr(rule.condition, { ...emptyScope(), vars: { [v.name]: val } }) === false)
+            throw new EvalError(`Invalid value for variable: ${rule.errorMessage}`, arg?.line ?? call.line, `El valor que el módulo raíz pasa a var.${v.name} no cumple la validación del módulo.`);
+        }
+        ms.vars[node.label] = val;
+      } else if (node.kind === 'local') {
+        ms.locals[node.label] = evalExpr(mcfg.locals[node.label].expr, ms);
       } else if (node.kind === 'output') {
-        const o = cfg.outputs[node.label];
-        outputs[o.name] = { value: evalExpr(o.value, scope), sensitive: o.sensitive };
+        const o = mcfg.outputs[node.label];
+        const value = evalExpr(o.value, ms);
+        if (!prefix) outputs[o.name] = { value, sensitive: o.sensitive };
+        else {
+          const { parentPrefix, callName } = parentOf(prefix);
+          (scopes[parentPrefix].modules[callName] ??= {})[o.name] = value;
+        }
       } else if (node.kind === 'resource' || node.kind === 'data') {
-        processResource(cfg.resources[id]);
+        processResource(mcfg.resources[node.key], prefix);
       }
     } catch (e) {
       if (e instanceof EvalError) {
         diags.push({ severity: 'error', summary: e.message, detail: e.detail, hint: e.hint, file: node.file, line: e.line ?? node.line });
-        return { changes, outputs, expanded, failed: true, scope };
+        return { changes, outputs, expanded, failed: true, scope, scopes };
       }
       throw e;
     }
   }
-  return { changes, outputs, expanded, failed: false, scope };
+  return { changes, outputs, expanded, failed: false, scope, scopes };
 }
 
 function prepare(files: Record<string, string>, opts: RunOptions) {
-  const cfg = loadConfig(files);
+  const cfg = loadConfig(files, opts.modules);
   const diags: Diagnostic[] = [...cfg.diagnostics];
   if (hasErrors(diags)) return { cfg, diags, graph: null, vars: null };
   const graph = buildGraph(cfg);
@@ -877,7 +930,7 @@ export function plan(files: Record<string, string>, prior: TfState, opts: RunOpt
   if (destroy) {
     const changes: ResourceChange[] = [];
     for (const inst of destroyOrder(Object.values(prior.resources).filter((r) => r.mode === 'managed'))) {
-      const rc = cfg.resources[inst.resourceAddr];
+      const rc = findResource(cfg, inst.resourceAddr);
       if (rc?.lifecycle.preventDestroy) {
         diags.push({
           severity: 'error',
@@ -892,6 +945,7 @@ export function plan(files: Record<string, string>, prior: TfState, opts: RunOpt
       changes.push({
         addr: inst.addr,
         resourceAddr: inst.resourceAddr,
+        module: inst.module,
         mode: 'managed',
         type: inst.type,
         name: inst.name,
@@ -926,6 +980,7 @@ export function plan(files: Record<string, string>, prior: TfState, opts: RunOpt
     res.changes.push({
       addr: inst.addr,
       resourceAddr: inst.resourceAddr,
+      module: inst.module,
       mode: 'managed',
       type: inst.type,
       name: inst.name,
@@ -993,16 +1048,16 @@ export function apply(files: Record<string, string>, prior: TfState, opts: RunOp
 }
 
 /** terraform validate: sintaxis, esquema y referencias, sin evaluar valores. */
-export function validate(files: Record<string, string>): { diagnostics: Diagnostic[]; config: Config; graph: DepGraph | null } {
-  const cfg = loadConfig(files);
+export function validate(files: Record<string, string>, modules?: InstalledModules): { diagnostics: Diagnostic[]; config: Config; graph: DepGraph | null } {
+  const cfg = loadConfig(files, modules);
   if (hasErrors(cfg.diagnostics)) return { diagnostics: cfg.diagnostics, config: cfg, graph: null };
   const graph = buildGraph(cfg);
   return { diagnostics: [...cfg.diagnostics, ...graph.diagnostics], config: cfg, graph };
 }
 
 /** terraform console: evalúa una expresión con las variables, locals y recursos actuales. */
-export function consoleEval(files: Record<string, string>, state: TfState, source: string): { value?: Value; error?: Diagnostic } {
-  const { cfg, diags, graph, vars } = prepare(files, {});
+export function consoleEval(files: Record<string, string>, state: TfState, source: string, modules?: InstalledModules): { value?: Value; error?: Diagnostic } {
+  const { cfg, diags, graph, vars } = prepare(files, { modules });
   let scope: Scope = { ...emptyScope(), vars: vars ?? {} };
   if (graph && vars && !hasErrors(diags)) {
     const res = walk({ cfg, graph, vars, cur: cloneState(state), realize: false, events: [], diags: [] });
@@ -1011,6 +1066,7 @@ export function consoleEval(files: Record<string, string>, state: TfState, sourc
   // Igual que Terraform: los recursos se leen del estado, no del código sin aplicar.
   scope = { ...scope, resources: {}, data: {} };
   for (const inst of Object.values(state.resources)) {
+    if (inst.module) continue;
     const byName = ((inst.mode === 'managed' ? scope.resources : scope.data)[inst.type] ??= {});
     if (inst.indexKey === undefined) byName[inst.name] = inst.attributes;
     else if (typeof inst.indexKey === 'number') {

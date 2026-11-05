@@ -11,6 +11,8 @@ interface Item {
   name: string;
   attrs: ValueMap;
   status: ItemStatus;
+  /** module.red si el recurso pertenece a un módulo. */
+  module?: string;
 }
 
 interface Props {
@@ -42,12 +44,12 @@ export function CloudCanvas({ state, plan, active, busy }: Props) {
     const items = new Map<string, Item>();
     for (const r of Object.values(state.resources)) {
       if (r.mode !== 'managed') continue;
-      items.set(r.addr, { addr: r.addr, type: r.type, name: r.name, attrs: r.attributes, status: 'live' });
+      items.set(r.addr, { addr: r.addr, type: r.type, name: r.name, attrs: r.attributes, status: 'live', module: r.module });
     }
     if (plan && !busy) {
       for (const c of plan.changes) {
         if (c.mode !== 'managed' || c.action === 'noop' || c.action === 'read') continue;
-        if (c.action === 'create') items.set(c.addr, { addr: c.addr, type: c.type, name: c.name, attrs: c.after!, status: 'create' });
+        if (c.action === 'create') items.set(c.addr, { addr: c.addr, type: c.type, name: c.name, attrs: c.after!, status: 'create', module: c.module });
         else {
           const it = items.get(c.addr);
           if (it) items.set(c.addr, { ...it, status: c.action as ItemStatus, attrs: c.action === 'delete' ? it.attrs : { ...it.attrs, ...(c.after ?? {}) } });
@@ -150,6 +152,7 @@ export function CloudCanvas({ state, plan, active, busy }: Props) {
                       <ResIcon type="aws_vpc" size={16} />
                     </span>
                     <span className="box-title">VPC {nameTag(vpc) ?? vpc.name}</span>
+                    <ModChip module={vpc.module} />
                     <span className="box-cidr">{str(vpc.attrs.cidr_block)}</span>
                     <StatusTag status={vpc.status} />
                   </div>
@@ -189,6 +192,7 @@ export function CloudCanvas({ state, plan, active, busy }: Props) {
                             <ResIcon type="aws_subnet" size={14} />
                           </span>
                           <span className="box-title">{nameTag(sn) ?? sn.name}</span>
+                          <ModChip module={sn.module} />
                           <StatusTag status={sn.status} />
                         </div>
                         <div className="subnet-meta">
@@ -272,6 +276,16 @@ function portsOf(sg: Item) {
   return '⬇ ' + ing.map((r) => (r.from_port === r.to_port ? str(r.from_port) : `${str(r.from_port)}-${str(r.to_port)}`)).join(', ');
 }
 
+/** Etiqueta que indica el módulo al que pertenece un recurso. */
+function ModChip({ module }: { module?: string }) {
+  if (!module) return null;
+  return (
+    <span className="mod-chip" title={module}>
+      📦 {module.replace(/^module\./, '').replace(/\.module\./g, ' › ')}
+    </span>
+  );
+}
+
 function StatusTag({ status }: { status: ItemStatus }) {
   if (status === 'live') return null;
   return <span className={`status-tag stt-${status}`}>{STATUS_TEXT[status]}</span>;
@@ -295,7 +309,9 @@ function ResourceCard({ item, active, selected, onSelect, children, compact }: {
       </div>
       <div className="rcard-body">
         <div className="rcard-title">{nameTag(item) ?? item.name}</div>
-        <div className="rcard-type">{schema?.title ?? item.type}</div>
+        <div className="rcard-type">
+          {schema?.title ?? item.type} <ModChip module={item.module} />
+        </div>
         {children}
       </div>
       <StatusTag status={item.status} />

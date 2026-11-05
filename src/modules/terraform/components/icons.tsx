@@ -19,6 +19,7 @@ const ICONS: Record<string, ReactNode> = {
   output: P(<><path d="M14 4h6v6M20 4l-9 9" /><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" /></>),
   data: P(<><circle cx="11" cy="11" r="6" /><path d="M20 20l-4.5-4.5" /></>),
   assoc: P(<><path d="M9 15l6-6" /><path d="M11 6l1-1a4 4 0 0 1 6 6l-1 1M13 18l-1 1a4 4 0 0 1-6-6l1-1" /></>),
+  module: P(<><path d='M12 3l8 4.5v9L12 21l-8-4.5v-9z' /><path d='M4 7.5l8 4.5 8-4.5M12 12v9' /></>),
   cloud: P(<path d="M7 18a4 4 0 0 1-.6-7.96A6 6 0 0 1 18 9a4.5 4.5 0 0 1-.5 9z" />),
 };
 
@@ -27,6 +28,7 @@ export function iconKeyFor(type: string | undefined, kind?: string): string {
   if (kind === 'local') return 'local';
   if (kind === 'output') return 'output';
   if (kind === 'data') return 'data';
+  if (kind === 'module') return 'module';
   switch (type) {
     case 'aws_vpc':
       return 'vpc';

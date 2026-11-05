@@ -1,4 +1,5 @@
-import { hasErrors, loadConfig, requiredProviderNames } from './config';
+import { allModuleCalls, hasErrors, loadConfig, requiredProviderNames, type Diagnostic, type InstalledModules } from './config';
+import { satisfies } from './registry';
 import { apply, consoleEval, plan, validate, type Action, type ApplyResult, type PlanResult } from './evaluate';
 import { renderDiagnostics, renderInstance, renderOutputs, renderPlan, valueLines, type TermLine, type Tone } from './format';
 import { buildGraph } from './graph';
@@ -70,7 +71,7 @@ function parseFlags(args: string[]) {
 
 export const HELP: TermLine[] = [
   L('Comandos disponibles en este simulador:', 'bold'),
-  L('  terraform init                 Descarga los proveedores necesarios'),
+  L('  terraform init [-upgrade]      Descarga proveedores y módulos'),
   L('  terraform validate             Comprueba que la configuración es válida'),
   L('  terraform plan                 Muestra qué cambios se harían'),
   L('  terraform apply                Aplica los cambios (pide confirmación)'),
@@ -88,19 +89,65 @@ export const HELP: TermLine[] = [
   L('Otros: ls, cat <fichero>, clear, help.  Atajo: "tf" equivale a "terraform".', 'muted'),
 ];
 
+const MOD = 'module:';
+
+/** Módulos instalados: entradas "module:<id>=<source>@<versión>" de la lista de init. */
+export function installedModules(initialized: string[]): InstalledModules {
+  const out: InstalledModules = {};
+  for (const e of initialized) {
+    if (!e.startsWith(MOD)) continue;
+    const [id, rest] = e.slice(MOD.length).split('=');
+    const at = rest.lastIndexOf('@');
+    out[id] = { source: rest.slice(0, at), version: rest.slice(at + 1) };
+  }
+  return out;
+}
+
+const providersOf = (initialized: string[]) => initialized.filter((x) => !x.startsWith(MOD));
+const shortName = (id: string) => id.replace(/^module\./, '').replace(/\.module\./g, '.');
+
+function checkModules(ctx: CliContext): Diagnostic[] {
+  const installed = installedModules(ctx.initialized);
+  const cfg = loadConfig(ctx.files, installed);
+  const diags: Diagnostic[] = [];
+  for (const call of allModuleCalls(cfg)) {
+    const inst = installed[call.id];
+    const base = { severity: 'error' as const, file: call.file, line: call.line };
+    if (!inst) {
+      diags.push({
+        ...base,
+        summary: 'Module not installed',
+        detail: 'This module is not yet installed. Run "terraform init" to install all modules required by this configuration.',
+        hint: `Has añadido el módulo "${shortName(call.id)}": terraform init lo instala (lo descarga del registro o enlaza la carpeta local) antes de poder usarlo.`,
+      });
+    } else if (inst.source !== call.source) {
+      diags.push({ ...base, summary: 'Module source has changed', detail: 'The source address was changed since this module was installed. Run "terraform init" to install all modules required by this configuration.', hint: 'Has cambiado el source del módulo: vuelve a ejecutar terraform init.' });
+    } else if (call.kind === 'registry' && call.version && !satisfies(inst.version, call.version)) {
+      diags.push({
+        ...base,
+        summary: 'Module version requirements have changed',
+        detail: `The version requirements have changed since this module was installed and the installed version (${inst.version}) is no longer acceptable. Run "terraform init" to install all modules required by this configuration.`,
+        hint: `La versión instalada (${inst.version}) no cumple "${call.version}". Ejecuta terraform init para descargar una compatible.`,
+      });
+    }
+  }
+  return diags;
+}
+
 function checkInit(ctx: CliContext): TermLine[] | null {
-  const cfg = loadConfig(ctx.files);
+  const cfg = loadConfig(ctx.files, installedModules(ctx.initialized));
   const needed = requiredProviderNames(cfg);
-  const missing = needed.filter((p) => !ctx.initialized.includes(p));
-  if (!missing.length) return null;
-  return renderDiagnostics([
+  const missing = needed.filter((p) => !providersOf(ctx.initialized).includes(p));
+  const modDiags = checkModules(ctx);
+  if (!missing.length) return modDiags.length ? renderDiagnostics(modDiags) : null;
+  return renderDiagnostics([...modDiags, 
     {
       severity: 'error',
-      summary: ctx.initialized.length ? 'Inconsistent dependency lock file' : 'Required plugins are not installed',
+      summary: providersOf(ctx.initialized).length ? 'Inconsistent dependency lock file' : 'Required plugins are not installed',
       detail: missing
         .map((p) => `- provider registry.terraform.io/${PROVIDERS[p].source}: required by this configuration but no version is selected`)
         .join('\n') + '\n\nTo make the initial dependency selections that will initialize the dependency lock file, run:\n  terraform init',
-      hint: ctx.initialized.length
+      hint: providersOf(ctx.initialized).length
         ? `Tu configuración usa un proveedor nuevo (${missing.join(', ')}). Ejecuta "terraform init" otra vez para descargarlo.`
         : 'Antes de nada hay que ejecutar "terraform init" para descargar los proveedores (los "plugins" que hablan con la nube).',
     },
@@ -114,7 +161,7 @@ export function runCommand(input: string, ctx: CliContext): CliOutcome {
   if (ctx.consoleMode) {
     if (trimmed === 'exit' || trimmed === 'quit') return { kind: 'lines', lines: [], consoleMode: false };
     if (!trimmed) return { kind: 'lines', lines: [] };
-    const r = consoleEval(ctx.files, ctx.state, trimmed);
+    const r = consoleEval(ctx.files, ctx.state, trimmed, installedModules(ctx.initialized));
     if (r.error) return { kind: 'lines', lines: renderDiagnostics([r.error]) };
     return { kind: 'lines', lines: valueLines(r.value!), history: { command: 'console-eval', ok: true, at: Date.now(), args: [trimmed] } };
   }
@@ -171,12 +218,31 @@ export function runCommand(input: string, ctx: CliContext): CliOutcome {
         lines: [
           L('Terraform v1.9.8 (simulado en el navegador)'),
           L('on browser_wasm'),
-          ...ctx.initialized.map((p) => L(`+ provider registry.terraform.io/${PROVIDERS[p].source} v${PROVIDERS[p].version}`)),
+          ...providersOf(ctx.initialized).map((p) => L(`+ provider registry.terraform.io/${PROVIDERS[p].source} v${PROVIDERS[p].version}`)),
         ],
       };
     case 'init': {
-      const cfg = loadConfig(ctx.files);
-      const lines: TermLine[] = [L('Initializing the backend...', 'bold'), L('Initializing provider plugins...', 'bold')];
+      const upgrade = flags.has('upgrade');
+      const installed = installedModules(ctx.initialized);
+      const cfg = loadConfig(ctx.files, upgrade ? {} : installed);
+      const lines: TermLine[] = [L('Initializing the backend...', 'bold')];
+      const calls = allModuleCalls(cfg);
+      if (calls.length) {
+        lines.push(L(upgrade ? 'Upgrading modules...' : 'Initializing modules...', 'bold'));
+        for (const c of calls) {
+          const n = shortName(c.id);
+          if (c.kind === 'local') {
+            if (c.dir !== undefined) lines.push(L(`- ${n} in ${c.dir}`));
+            continue;
+          }
+          if (!c.resolvedVersion) continue;
+          const prev = installed[c.id];
+          if (!prev || prev.source !== c.source || prev.version !== c.resolvedVersion)
+            lines.push(L(`Downloading registry.terraform.io/${c.source} ${c.resolvedVersion} for ${n}...`, 'info'));
+          lines.push(L(`- ${n} in .terraform/modules/${n}`));
+        }
+      }
+      lines.push(L('Initializing provider plugins...', 'bold'));
       if (hasErrors(cfg.diagnostics)) {
         return {
           kind: 'lines',
@@ -188,7 +254,7 @@ export function runCommand(input: string, ctx: CliContext): CliOutcome {
       for (const p of needed) {
         const info = PROVIDERS[p];
         const v = cfg.requiredProviders[p]?.version;
-        if (ctx.initialized.includes(p)) {
+        if (providersOf(ctx.initialized).includes(p)) {
           lines.push(L(`- Reusing previous version of ${info.source} from the dependency lock file`));
           lines.push(L(`- Using previously-installed ${info.source} v${info.version}`));
         } else {
@@ -209,13 +275,16 @@ export function runCommand(input: string, ctx: CliContext): CliOutcome {
       return {
         kind: 'lines',
         lines,
-        initialized: [...new Set([...ctx.initialized, ...needed])].sort(),
+        initialized: [
+          ...[...new Set([...providersOf(ctx.initialized), ...needed])].sort(),
+          ...calls.filter((c) => c.kind === 'local' || c.resolvedVersion).map((c) => `${MOD}${c.id}=${c.source}@${c.resolvedVersion ?? ''}`),
+        ],
         history: { command: 'init', ok: true, at: now },
       };
     }
     case 'validate': {
       const notInit = checkInit(ctx);
-      const v = validate(ctx.files);
+      const v = validate(ctx.files, installedModules(ctx.initialized));
       if (hasErrors(v.diagnostics)) {
         return { kind: 'lines', lines: renderDiagnostics(v.diagnostics), history: { command: 'validate', ok: false, at: now } };
       }
@@ -232,7 +301,7 @@ export function runCommand(input: string, ctx: CliContext): CliOutcome {
     case 'plan': {
       const notInit = checkInit(ctx);
       if (notInit) return { kind: 'lines', lines: notInit, history: { command: 'plan', ok: false, at: now } };
-      const p = plan(ctx.files, ctx.state, { cliVars, destroy: flags.has('destroy') });
+      const p = plan(ctx.files, ctx.state, { modules: installedModules(ctx.initialized), cliVars, destroy: flags.has('destroy') });
       return {
         kind: 'lines',
         lines: renderPlan(p),
@@ -246,7 +315,7 @@ export function runCommand(input: string, ctx: CliContext): CliOutcome {
       const notInit = checkInit(ctx);
       const command = destroy ? 'destroy' : 'apply';
       if (notInit) return { kind: 'lines', lines: notInit, history: { command, ok: false, at: now } };
-      const p = plan(ctx.files, ctx.state, { cliVars, destroy });
+      const p = plan(ctx.files, ctx.state, { modules: installedModules(ctx.initialized), cliVars, destroy });
       const lines = renderPlan(p);
       const history: HistoryEntry = { command, ok: p.ok, at: now, summary: p.summary, actions: actionsOf(p), args: rest };
       if (!p.ok) return { kind: 'lines', lines, plan: p, history };
@@ -257,7 +326,7 @@ export function runCommand(input: string, ctx: CliContext): CliOutcome {
         return { kind: 'lines', lines, plan: p, history };
       }
       if (flags.has('auto-approve')) {
-        const result = apply(ctx.files, ctx.state, { cliVars, destroy });
+        const result = apply(ctx.files, ctx.state, { modules: installedModules(ctx.initialized), cliVars, destroy });
         return { kind: 'apply', lines, result, history };
       }
       lines.push(
@@ -324,7 +393,7 @@ export function runCommand(input: string, ctx: CliContext): CliOutcome {
       return { kind: 'lines', lines: [L('Uso: terraform state <list|show|rm> [dirección]', 'error')] };
     }
     case 'graph': {
-      const cfg = loadConfig(ctx.files);
+      const cfg = loadConfig(ctx.files, installedModules(ctx.initialized));
       if (hasErrors(cfg.diagnostics)) return { kind: 'lines', lines: renderDiagnostics(cfg.diagnostics) };
       const g = buildGraph(cfg);
       const lines = [L('digraph {'), L('  rankdir = "RL"')];
@@ -356,7 +425,7 @@ export function runCommand(input: string, ctx: CliContext): CliOutcome {
 
 /** Ejecuta un apply ya confirmado ('yes'). */
 export function confirmApply(pending: PendingApply, ctx: CliContext): ApplyResult {
-  return apply(ctx.files, ctx.state, { cliVars: pending.cliVars, destroy: pending.destroy });
+  return apply(ctx.files, ctx.state, { modules: installedModules(ctx.initialized), cliVars: pending.cliVars, destroy: pending.destroy });
 }
 
 export function applySummaryLines(r: ApplyResult): TermLine[] {

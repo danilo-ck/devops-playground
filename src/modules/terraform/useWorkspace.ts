@@ -6,6 +6,7 @@ import {
   confirmApply,
   deserializeState,
   emptyState,
+  installedModules,
   loadConfig,
   renderApplyEvent,
   requiredProviderNames,
@@ -83,7 +84,7 @@ export function useTerraformWorkspace(lesson: TerraformLesson) {
     const t = setTimeout(() => setAnalyzed(files), 250);
     return () => clearTimeout(t);
   }, [files]);
-  const analysis = useMemo(() => validate(analyzed), [analyzed]);
+  const analysis = useMemo(() => validate(analyzed, installedModules(initialized)), [analyzed, initialized]);
 
   // Persistencia
   useEffect(() => {
