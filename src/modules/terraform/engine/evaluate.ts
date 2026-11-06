@@ -1,10 +1,12 @@
-import { findResource, hasErrors, loadConfig, moduleConfigs, type Config, type Diagnostic, type InstalledModules, type ResourceConfig } from './config';
+import { afterRefresh, emptyCloud, refreshState, type CloudChanges, type CloudObject, type DriftChange } from './cloud';
+import { findResource, hasErrors, loadConfig, moduleConfigs, splitAddr, type Condition, type Config, type Diagnostic, type InstalledModules, type ResourceConfig } from './config';
 import { callFunction, FunctionError } from './functions';
 import { buildGraph, nodePrefix, resourceDependencies, type DepGraph } from './graph';
 import { parseExpressionSource, parseHcl, type Body, type Expr } from './parser';
 import { getSchema, providerOf, type ArgSpec, type GenCtx, type ResourceSchema } from './providers';
-import { cloneState, instanceAddr, type InstanceState, type TfState } from './state';
+import { applyMoves, cloneState, instanceAddr, type InstanceState, type TfState } from './state';
 import {
+  cloneValue,
   containsUnknown,
   deepEqual,
   isMap,
@@ -44,6 +46,16 @@ export interface ResourceChange {
   replaceReasons: string[];
   sensitiveAttrs: string[];
   createBeforeDestroy: boolean;
+  /** Si el recurso se va a importar en este plan: id del objeto real. */
+  importing?: string;
+  /** Dirección anterior si un bloque moved lo ha renombrado. */
+  movedFrom?: string;
+  /** Reemplazo forzado: -replace=… o recurso tainted. */
+  reason?: 'requested' | 'tainted';
+  /** Atributos write-only enviados en este plan (nunca se guardan). */
+  writeOnlyAttrs?: string[];
+  /** Región de AWS donde vive (según su configuración de proveedor). */
+  region?: string;
 }
 
 export interface OutputChange {
@@ -54,19 +66,34 @@ export interface OutputChange {
   sensitive: boolean;
 }
 
+export interface PlanSummary {
+  add: number;
+  change: number;
+  destroy: number;
+  import: number;
+}
+
 export interface PlanResult {
   ok: boolean;
   destroy: boolean;
+  /** terraform plan -refresh-only: solo sincroniza el estado con la nube real. */
+  refreshOnly: boolean;
+  /** Cambios hechos fuera de Terraform que ha detectado el refresh. */
+  drift: DriftChange[];
+  /** Estado tras el refresh y los imports: el punto de partida del apply. */
+  base: TfState;
+  /** Renombrados por bloques moved (direcciones de instancia). */
+  moves: { from: string; to: string }[];
   diagnostics: Diagnostic[];
   config: Config;
   graph: DepGraph | null;
   changes: ResourceChange[];
   outputChanges: OutputChange[];
   outputs: Record<string, { value: Value; sensitive: boolean }>;
-  summary: { add: number; change: number; destroy: number };
+  summary: PlanSummary;
 }
 
-export type Phase = 'creating' | 'modifying' | 'destroying' | 'reading';
+export type Phase = 'creating' | 'modifying' | 'destroying' | 'reading' | 'importing';
 
 export interface ApplyEvent {
   kind: 'start' | 'complete' | 'error';
@@ -82,6 +109,10 @@ export interface ApplyResult extends PlanResult {
   state: TfState;
   events: ApplyEvent[];
   applied: boolean;
+  /** Cambios fuera de Terraform que siguen pendientes tras el apply. */
+  cloud: CloudChanges;
+  /** Avisos que aparecen durante el apply (p.ej. check blocks evaluados con valores reales). */
+  applyWarnings: Diagnostic[];
 }
 
 export interface RunOptions {
@@ -90,6 +121,20 @@ export interface RunOptions {
   /** Versiones de módulos instaladas por terraform init. */
   modules?: InstalledModules;
   destroy?: boolean;
+  /** Cambios hechos fuera de Terraform (la "nube real"). */
+  cloud?: CloudChanges;
+  /** false = -refresh=false: no consulta la nube real antes de planificar. */
+  refresh?: boolean;
+  /** -refresh-only: solo actualiza el estado con lo que hay en la nube. */
+  refreshOnly?: boolean;
+  /** Variables de entorno (TF_VAR_nombre). */
+  env?: Record<string, string>;
+  /** Ficheros pasados con -var-file, en orden. */
+  varFiles?: string[];
+  /** Workspace actual (terraform.workspace). */
+  workspace?: string;
+  /** -replace=dirección: fuerza el reemplazo de esas instancias. */
+  replace?: string[];
 }
 
 // ------------------------------------------------------------ evaluación de expresiones
@@ -116,6 +161,7 @@ interface Scope {
   each?: { key: Value; value: Value };
   bound: Record<string, Value>;
   splatItem?: Value;
+  workspace?: string;
 }
 
 const emptyScope = (): Scope => ({ vars: {}, locals: {}, resources: {}, data: {}, modules: {}, bound: {} });
@@ -185,7 +231,7 @@ export function evalExpr(e: Expr, s: Scope): Value {
         case 'module':
           return s.modules;
         case 'terraform':
-          return { workspace: 'default' };
+          return { workspace: s.workspace ?? 'default' };
       }
       if (e.name in s.resources) return s.resources[e.name];
       throw new EvalError(`Invalid reference: "${e.name}"`, e.line, 'Una referencia a un recurso necesita tipo y nombre, p.ej. aws_vpc.main.id. Si es un texto, ponlo entre comillas.');
@@ -392,11 +438,196 @@ function evalBody(body: Body, spec: Record<string, ArgSpec>, s: Scope): ValueMap
     out[a.name] = coerce(evalExpr(a.expr, s), argSpec, a.name, a.line);
   }
   for (const b of body.blocks) {
+    if (b.type === 'dynamic') {
+      const label = b.labels[0];
+      const bs = spec[label];
+      const fe = b.body.attributes.find((a) => a.name === 'for_each');
+      const content = b.body.blocks.find((x) => x.type === 'content');
+      if (!bs || bs.type !== 'block' || !fe || !content) continue;
+      const it = b.body.attributes.find((a) => a.name === 'iterator')?.expr;
+      const name = it?.kind === 'variable' ? it.name : label;
+      const coll = evalExpr(fe.expr, s);
+      if (isUnknown(coll)) {
+        out[label] = new Unknown();
+        continue;
+      }
+      let entries: [Value, Value][];
+      if (coll === null) entries = [];
+      else if (Array.isArray(coll)) entries = coll.map((v, i) => [isSet(coll) ? v : i, v]);
+      else if (isMap(coll)) entries = Object.entries(coll);
+      else throw new EvalError(`Invalid dynamic for_each value: Cannot use a ${typeName(coll)} value in for_each. An iterable collection is required.`, fe.line, 'El for_each de un dynamic necesita una lista, un set o un mapa.');
+      const list = (Array.isArray(out[label]) ? out[label] : (out[label] = [])) as Value[];
+      for (const [k, v] of entries) list.push(evalBody(content.body, bs.block ?? {}, { ...s, bound: { ...s.bound, [name]: { key: k, value: v } } }));
+      continue;
+    }
     const bs = spec[b.type];
     if (!bs || bs.type !== 'block') continue;
     ((out[b.type] ??= []) as Value[]).push(evalBody(b.body, bs.block ?? {}, s));
   }
   return out;
+}
+
+// ------------------------------------------------------------ sensible y efímero
+
+/** ¿La expresión usa algún valor que cumpla `leaf`? sensitive()/nonsensitive() se tratan aparte. */
+function exprUses(e: Expr, leaf: (path: string[]) => boolean, calls: { mark?: string; unmark?: string } = {}): boolean {
+  const visit = (x: Expr): boolean => {
+    switch (x.kind) {
+      case 'call':
+        if (x.name === calls.unmark) return false;
+        if (x.name === calls.mark) return true;
+        return x.args.some(visit);
+      case 'getattr':
+      case 'index':
+      case 'splat': {
+        const names: string[] = [];
+        let cur: Expr = x;
+        let inner = false;
+        for (;;) {
+          if (cur.kind === 'getattr') {
+            names.unshift(cur.name);
+            cur = cur.target;
+          } else if (cur.kind === 'index') {
+            inner = inner || visit(cur.key);
+            cur = cur.target;
+          } else if (cur.kind === 'splat') {
+            let c: Expr = cur.chain;
+            const chain: string[] = [];
+            while (c.kind === 'getattr') {
+              chain.unshift(c.name);
+              c = c.target;
+            }
+            names.unshift(...chain);
+            cur = cur.target;
+          } else break;
+        }
+        if (inner) return true;
+        return cur.kind === 'variable' ? leaf([cur.name, ...names]) : visit(cur);
+      }
+      case 'variable':
+        return leaf([x.name]);
+      case 'template':
+        return x.parts.some((p) => typeof p !== 'string' && visit(p));
+      case 'unary':
+        return visit(x.operand);
+      case 'binary':
+        return visit(x.left) || visit(x.right);
+      case 'conditional':
+        return visit(x.cond) || visit(x.then) || visit(x.else);
+      case 'tuple':
+        return x.items.some(visit);
+      case 'object':
+        return x.items.some((i) => visit(i.key) || visit(i.value));
+      case 'for':
+        return visit(x.coll) || visit(x.valExpr) || (!!x.keyExpr && visit(x.keyExpr)) || (!!x.cond && visit(x.cond));
+      default:
+        return false;
+    }
+  };
+  return visit(e);
+}
+
+/** ¿Deriva de un valor sensible? (variable sensitive, atributo sensible, output sensible de un módulo, sensitive()) */
+export function isSensitiveExpr(e: Expr, cfg: Config, seen: Set<string> = new Set()): boolean {
+  return exprUses(
+    e,
+    (p) => {
+      if (p[0] === 'var') return !!cfg.variables[p[1]]?.sensitive;
+      if (p[0] === 'local') {
+        const l = cfg.locals[p[1]];
+        if (!l || seen.has(p[1])) return false;
+        seen.add(p[1]);
+        return isSensitiveExpr(l.expr, cfg, seen);
+      }
+      if (p[0] === 'module') return !!cfg.children[p[1]]?.outputs[p[2]]?.sensitive;
+      const [mode, type, attr] = p[0] === 'data' ? ['data' as const, p[1], p[3]] : ['managed' as const, p[0], p[2]];
+      const schema = getSchema(mode, type);
+      return !!schema && !!attr && sensitiveAttrs(schema).includes(attr);
+    },
+    { mark: 'sensitive', unmark: 'nonsensitive' },
+  );
+}
+
+/** ¿Deriva de un valor efímero? (variable ephemeral o output ephemeral de un módulo) */
+export function isEphemeralExpr(e: Expr, cfg: Config, seen: Set<string> = new Set()): boolean {
+  return exprUses(e, (p) => {
+    if (p[0] === 'var') return !!cfg.variables[p[1]]?.ephemeral;
+    if (p[0] === 'local') {
+      const l = cfg.locals[p[1]];
+      if (!l || seen.has(p[1])) return false;
+      seen.add(p[1]);
+      return isEphemeralExpr(l.expr, cfg, seen);
+    }
+    if (p[0] === 'module') return !!cfg.children[p[1]]?.outputs[p[2]]?.ephemeral;
+    return false;
+  });
+}
+
+const META_ARGS = new Set(['count', 'for_each', 'depends_on', 'provider']);
+
+/** Reglas de uso de valores sensibles y efímeros (se comprueban sin evaluar nada). */
+export function semanticChecks(root: Config): Diagnostic[] {
+  const diags: Diagnostic[] = [];
+  for (const cfg of Object.values(moduleConfigs(root))) {
+    for (const rc of Object.values(cfg.resources)) {
+      const schema = getSchema(rc.mode, rc.type);
+      if (!schema) continue;
+      for (const a of rc.body.attributes) {
+        if (META_ARGS.has(a.name) || !schema.args[a.name] || schema.args[a.name].writeOnly) continue;
+        if (isEphemeralExpr(a.expr, cfg))
+          diags.push({
+            severity: 'error',
+            summary: 'Invalid use of ephemeral value',
+            detail: `Ephemeral values are not valid for "${a.name}", because it is not a write-only attribute and must be persisted to state.`,
+            hint: `Un valor ephemeral nunca se guarda, pero "${a.name}" acabaría en el estado. Úsalo solo en argumentos write-only (como password_wo), en la configuración del proveedor o en otras variables/locals efímeros.`,
+            file: rc.file,
+            line: a.line,
+          });
+      }
+    }
+    for (const o of Object.values(cfg.outputs)) {
+      if (!cfg.prefix && !o.sensitive && isSensitiveExpr(o.value, cfg))
+        diags.push({
+          severity: 'error',
+          summary: 'Output refers to sensitive values',
+          detail: 'To reduce the risk of accidentally exporting sensitive data that was intended to be only internal, Terraform requires that any root module output containing sensitive data be explicitly marked as sensitive, to confirm your intent.\n\nIf you do intend to export this data, annotate the output value as sensitive by adding the following argument:\n    sensitive = true',
+          hint: `El output "${o.name}" usa un valor sensible. Añade sensitive = true (se ocultará en la terminal, pero seguirá guardado en el estado).`,
+          file: o.file,
+          line: o.line,
+        });
+      if (!o.ephemeral && isEphemeralExpr(o.value, cfg))
+        diags.push({
+          severity: 'error',
+          summary: 'Ephemeral value not allowed',
+          detail: 'This output value is not declared as returning an ephemeral value, so it cannot be set to a result derived from an ephemeral value.',
+          hint: cfg.prefix ? 'Marca el output con ephemeral = true.' : 'Un valor efímero no puede salir por un output del módulo raíz: se guardaría en el estado.',
+          file: o.file,
+          line: o.line,
+        });
+    }
+  }
+  return diags;
+}
+
+function conditionMessage(c: Condition, s: Scope): string {
+  try {
+    const m = evalExpr(c.errorMessage, s);
+    return typeof m === 'string' ? m : formatValueShort(m);
+  } catch {
+    return 'Condition failed';
+  }
+}
+const formatValueShort = (v: Value) => (isUnknown(v) ? '(known after apply)' : JSON.stringify(v));
+
+/** Evalúa una condición: lanza EvalError si es falsa; no hace nada si aún es desconocida. */
+function checkCondition(c: Condition, s: Scope, summary: string, where: string): void {
+  const ok = evalExpr(c.condition, s);
+  if (isUnknown(ok) || containsUnknown(ok)) return;
+  if (ok !== true && ok !== 'true') {
+    if (ok !== false && ok !== 'false') throw new EvalError(`Invalid condition result: a bool is required (recibido ${typeName(ok)})`, c.line, 'condition tiene que dar true o false.');
+    const msg = conditionMessage(c, s);
+    throw new EvalError(summary, c.line, `La condición de ${where} no se cumple: ${msg}`, msg);
+  }
 }
 
 function normalize(args: ValueMap, schema: ResourceSchema): ValueMap {
@@ -456,42 +687,67 @@ function convertVar(v: Value, type: string, name: string): Value {
   }
 }
 
-function resolveVariables(cfg: Config, files: Record<string, string>, cliVars: Record<string, string>, diags: Diagnostic[]): ValueMap | null {
-  const tfvars: ValueMap = {};
-  for (const [file, src] of Object.entries(files)) {
-    if (!file.endsWith('.tfvars') || file.includes('/')) continue;
-    const { body, error } = parseHcl(src);
-    if (!body) {
-      diags.push({ severity: 'error', summary: 'Syntax error', detail: error!.message, hint: error!.hint, file, line: error!.line });
+function parseVarFile(file: string, src: string, cfg: Config, diags: Diagnostic[]): ValueMap | null {
+  const out: ValueMap = {};
+  const { body, error } = parseHcl(src);
+  if (!body) {
+    diags.push({ severity: 'error', summary: 'Syntax error', detail: error!.message, hint: error!.hint, file, line: error!.line });
+    return null;
+  }
+  for (const a of body.attributes) {
+    try {
+      out[a.name] = evalExpr(a.expr, emptyScope());
+    } catch (e) {
+      if (e instanceof EvalError) {
+        diags.push({ severity: 'error', summary: e.message, hint: 'En un fichero .tfvars solo puedes usar valores literales, no referencias.', file, line: a.line });
+        return null;
+      }
+      throw e;
+    }
+    if (!cfg.variables[a.name]) {
+      diags.push({
+        severity: 'warning',
+        summary: 'Value for undeclared variable',
+        detail: `The root module does not declare a variable named "${a.name}".`,
+        hint: `Has dado valor a "${a.name}" en ${file}, pero no existe ningún bloque variable "${a.name}".`,
+        file,
+        line: a.line,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * Precedencia (de menor a mayor): default → TF_VAR_nombre → terraform.tfvars →
+ * *.auto.tfvars (orden alfabético) → -var-file (en orden) → -var.
+ */
+function resolveVariables(cfg: Config, files: Record<string, string>, opts: RunOptions, diags: Diagnostic[]): ValueMap | null {
+  const cliVars = opts.cliVars ?? {};
+  const raw: Record<string, { value: Value | string; parse: boolean }> = {};
+  for (const [k, v] of Object.entries(opts.env ?? {})) {
+    if (k.startsWith('TF_VAR_') && cfg.variables[k.slice(7)]) raw[k.slice(7)] = { value: v, parse: true };
+  }
+  const auto = Object.keys(files)
+    .filter((f) => !f.includes('/') && (f === 'terraform.tfvars' || f.endsWith('.auto.tfvars')))
+    .sort((a, b) => (a === 'terraform.tfvars' ? -1 : b === 'terraform.tfvars' ? 1 : a.localeCompare(b)));
+  for (const vf of opts.varFiles ?? []) {
+    if (files[vf] === undefined) {
+      diags.push({ severity: 'error', summary: 'Failed to read variables file', detail: `Given variables file ${vf} does not exist.`, hint: 'Crea el fichero con el botón + del editor o revisa el nombre.' });
       return null;
     }
-    for (const a of body.attributes) {
-      try {
-        tfvars[a.name] = evalExpr(a.expr, emptyScope());
-      } catch (e) {
-        if (e instanceof EvalError) {
-          diags.push({ severity: 'error', summary: e.message, hint: 'En un fichero .tfvars solo puedes usar valores literales, no referencias.', file, line: a.line });
-          return null;
-        }
-        throw e;
-      }
-      if (!cfg.variables[a.name]) {
-        diags.push({
-          severity: 'warning',
-          summary: 'Value for undeclared variable',
-          detail: `The root module does not declare a variable named "${a.name}".`,
-          hint: `Has dado valor a "${a.name}" en ${file}, pero no existe ningún bloque variable "${a.name}".`,
-          file,
-          line: a.line,
-        });
-      }
-    }
+  }
+  for (const file of [...auto, ...(opts.varFiles ?? [])]) {
+    const vals = parseVarFile(file, files[file], cfg, diags);
+    if (!vals) return null;
+    for (const [k, v] of Object.entries(vals)) raw[k] = { value: v, parse: false };
   }
   for (const name of Object.keys(cliVars)) {
     if (!cfg.variables[name]) {
       diags.push({ severity: 'error', summary: 'Value for undeclared variable', detail: `A variable named "${name}" was assigned on the command line, but the root module does not declare a variable of that name.`, hint: `Declara primero: variable "${name}" {}` });
       return null;
     }
+    raw[name] = { value: cliVars[name], parse: true };
   }
 
   const vars: ValueMap = {};
@@ -499,11 +755,10 @@ function resolveVariables(cfg: Config, files: Record<string, string>, cliVars: R
     const type = typeConstraint(v.type);
     let val: Value | undefined;
     try {
-      if (v.name in cliVars) {
-        const raw = cliVars[v.name];
-        val = ['list', 'set', 'map', 'object', 'tuple'].includes(type) ? evalExpr(parseExpressionSource(raw, 1), emptyScope()) : raw;
-      } else if (v.name in tfvars) val = tfvars[v.name];
-      else if (v.default) val = evalExpr(v.default, emptyScope());
+      const given = raw[v.name];
+      if (given) {
+        val = given.parse && typeof given.value === 'string' && ['list', 'set', 'map', 'object', 'tuple'].includes(type) ? evalExpr(parseExpressionSource(given.value, 1), emptyScope()) : (given.value as Value);
+      } else if (v.default) val = evalExpr(v.default, emptyScope());
       if (val === undefined) {
         diags.push({
           severity: 'error',
@@ -573,7 +828,10 @@ interface WalkContext {
   realize: boolean;
   events: ApplyEvent[];
   diags: Diagnostic[];
-  /** Acciones planificadas (solo apply): para saber qué era un reemplazo. */
+  /** Objetos de la nube que Terraform no gestiona (para detectar choques de nombres). */
+  unmanaged?: Record<string, CloudObject>;
+  workspace?: string;
+  replace?: string[];
 }
 
 interface WalkResult {
@@ -597,7 +855,7 @@ function walk(ctx: WalkContext): WalkResult {
   const configs = moduleConfigs(cfg);
   const scopes: Record<string, Scope> = {};
   for (const [p, c] of Object.entries(configs)) {
-    scopes[p] = { ...emptyScope(), vars: p === '' ? ctx.vars : {} };
+    scopes[p] = { ...emptyScope(), vars: p === '' ? ctx.vars : {}, workspace: ctx.workspace ?? 'default' };
     for (const name of Object.keys(c.moduleCalls)) scopes[p].modules[name] = {};
   }
   const scope = scopes[''];
@@ -609,7 +867,8 @@ function walk(ctx: WalkContext): WalkResult {
   const regionOf = (provider: string): string => {
     if (regions[provider]) return regions[provider];
     let region = 'us-east-1';
-    const p = cfg.providers.find((x) => x.name === provider);
+    const [pname, alias] = provider.split('.');
+    const p = cfg.providers.find((x) => x.name === pname && x.alias === alias);
     const attr = p?.body.attributes.find((a) => a.name === 'region');
     if (p && attr) {
       const v = evalExpr(attr.expr, scope);
@@ -640,7 +899,10 @@ function walk(ctx: WalkContext): WalkResult {
     const fullAddr = prefix + rc.addr;
     const module = prefix ? prefix.slice(0, -1) : undefined;
     const schema = getSchema(rc.mode, rc.type)!;
-    const region = providerOf(rc.type) === 'aws' ? regionOf('aws') : 'local';
+    const region = providerOf(rc.type) === 'aws' ? regionOf(prefix ? 'aws' : rc.provider) : 'local';
+    const mcfgR = configs[prefix];
+    const sensFromExpr = rc.body.attributes.filter((a) => schema.args[a.name] && !META_ARGS.has(a.name) && isSensitiveExpr(a.expr, mcfgR)).map((a) => a.name);
+    const writeOnly = Object.entries(schema.args).filter(([, a]) => a.writeOnly).map(([n]) => n);
     const deps = resourceDependencies(graph, fullAddr).filter((d) => graph.nodes[d]?.kind !== 'data');
 
     let keys: (string | number | undefined)[] = [undefined];
@@ -700,9 +962,13 @@ function walk(ctx: WalkContext): WalkResult {
       const args = normalize(evalBody(rc.body, schema.args, s), schema);
       const msg = schema.validate?.(args, { region });
       if (msg) throw new EvalError(msg, rc.line, undefined);
+      for (const c of rc.preconditions) checkCondition(c, s, 'Resource precondition failed', addr);
+      // Los argumentos write-only se envían a la nube, pero nunca se guardan ni se comparan.
+      const woSent = writeOnly.filter((n) => args[n] !== null && args[n] !== undefined);
+      for (const n of writeOnly) args[n] = null;
       expanded.add(addr);
       const prior = cur.resources[addr];
-      const sens = sensitiveAttrs(schema);
+      const sens = [...new Set([...sensitiveAttrs(schema), ...sensFromExpr])];
       const base = {
         addr,
         resourceAddr: fullAddr,
@@ -713,6 +979,8 @@ function walk(ctx: WalkContext): WalkResult {
         indexKey: key,
         sensitiveAttrs: sens,
         createBeforeDestroy: rc.lifecycle.createBeforeDestroy,
+        ...(region !== 'local' ? { region } : {}),
+        ...(woSent.length ? { writeOnlyAttrs: woSent } : {}),
       };
 
       let value: ValueMap;
@@ -733,6 +1001,7 @@ function walk(ctx: WalkContext): WalkResult {
         const diffs: AttrDiff[] = [];
         const reasons: string[] = [];
         let action: Action = 'create';
+        let reason: ResourceChange['reason'];
         const effective: ValueMap = { ...args };
         if (prior) {
           for (const [name, spec] of Object.entries(schema.args)) {
@@ -748,11 +1017,13 @@ function walk(ctx: WalkContext): WalkResult {
             }
           }
           action = diffs.length === 0 ? 'noop' : reasons.length ? 'replace' : 'update';
+          reason = ctx.replace?.includes(addr) ? 'requested' : prior.tainted ? 'tainted' : undefined;
+          if (reason) action = 'replace';
           if (action === 'replace' && rc.lifecycle.preventDestroy) {
             throw new EvalError(
               'Instance cannot be destroyed',
               rc.line,
-              `${addr} tiene lifecycle { prevent_destroy = true } y el cambio en ${reasons.join(', ')} obliga a destruirlo. Quita prevent_destroy si de verdad quieres reemplazarlo.`,
+              `${addr} tiene lifecycle { prevent_destroy = true } y ${reason === 'requested' ? 'has pedido reemplazarlo con -replace' : reason === 'tainted' ? 'está marcado como tainted' : `el cambio en ${reasons.join(', ')} obliga a destruirlo`}. Quita prevent_destroy si de verdad quieres reemplazarlo.`,
             );
           }
         }
@@ -770,7 +1041,7 @@ function walk(ctx: WalkContext): WalkResult {
           } else {
             value = prior!.attributes;
           }
-          changes.push({ ...base, action, before: prior?.attributes ?? null, after: value, diffs, replaceReasons: reasons });
+          changes.push({ ...base, action, before: prior?.attributes ?? null, after: value, diffs, replaceReasons: reasons, ...(reason ? { reason } : {}) });
         } else {
           // ----- apply real
           const gctx = genCtx(addr, region);
@@ -780,7 +1051,10 @@ function walk(ctx: WalkContext): WalkResult {
             }
             const secs = fakeSeconds('creating', rc.type);
             events.push({ kind: 'start', addr, phase: 'creating', seconds: 0, state: snapshot() });
-            const err = schema.applyCheck?.(effective, gctx);
+            const owned = rc.type === 'aws_s3_bucket' && typeof effective.bucket === 'string' ? ctx.unmanaged?.[effective.bucket] : undefined;
+            const err = owned
+              ? `BucketAlreadyOwnedByYou: ya tienes un bucket "${effective.bucket}" en tu cuenta, creado fuera de Terraform. Impórtalo (bloque import o terraform import) para que Terraform lo gestione en lugar de intentar crearlo.`
+              : schema.applyCheck?.(effective, gctx);
             if (err) {
               events.push({ kind: 'error', addr, phase: 'creating', seconds: secs, message: err, state: snapshot() });
               throw new EvalError(`creating ${schema.title} (${addr}): ${err}`, rc.line);
@@ -809,6 +1083,8 @@ function walk(ctx: WalkContext): WalkResult {
           }
         }
       }
+
+      for (const c of rc.postconditions) checkCondition(c, { ...s, bound: { ...s.bound, self: value } }, 'Resource postcondition failed', addr);
 
       if (Array.isArray(container)) container.push(value);
       else if (isMap(container)) container[String(key)] = value;
@@ -848,6 +1124,7 @@ function walk(ctx: WalkContext): WalkResult {
         ms.locals[node.label] = evalExpr(mcfg.locals[node.label].expr, ms);
       } else if (node.kind === 'output') {
         const o = mcfg.outputs[node.label];
+        for (const c of o.preconditions) checkCondition(c, ms, 'Module output value precondition failed', `output.${o.name}`);
         const value = evalExpr(o.value, ms);
         if (!prefix) outputs[o.name] = { value, sensitive: o.sensitive };
         else {
@@ -865,6 +1142,24 @@ function walk(ctx: WalkContext): WalkResult {
       throw e;
     }
   }
+  // check blocks: se evalúan al final y solo generan avisos.
+  for (const chk of cfg.checks) {
+    for (const a of chk.asserts) {
+      const at = { file: a.file, line: a.line };
+      try {
+        const ok = evalExpr(a.condition, scope);
+        if (isUnknown(ok) || containsUnknown(ok)) {
+          if (!realize)
+            diags.push({ severity: 'warning', summary: 'Check block assertion known after apply', detail: 'The condition could not be evaluated at this time, a result will be known when this plan is applied.', hint: `check "${chk.name}" depende de valores que aún no existen: se comprobará durante el apply.`, ...at });
+        } else if (ok !== true) {
+          diags.push({ severity: 'warning', summary: 'Check block assertion failed', detail: conditionMessage(a, scope), hint: `check "${chk.name}" no se cumple. Los check solo avisan: no bloquean el plan ni el apply.`, ...at });
+        }
+      } catch (e) {
+        if (!(e instanceof EvalError)) throw e;
+        diags.push({ severity: 'warning', summary: `Check block assertion failed: ${e.message}`, hint: e.hint, ...at });
+      }
+    }
+  }
   return { changes, outputs, expanded, failed: false, scope, scopes };
 }
 
@@ -875,16 +1170,19 @@ function prepare(files: Record<string, string>, opts: RunOptions) {
   const graph = buildGraph(cfg);
   diags.push(...graph.diagnostics);
   if (hasErrors(diags)) return { cfg, diags, graph, vars: null };
-  const vars = resolveVariables(cfg, files, opts.cliVars ?? {}, diags);
+  diags.push(...semanticChecks(cfg));
+  if (hasErrors(diags)) return { cfg, diags, graph, vars: null };
+  const vars = resolveVariables(cfg, files, opts, diags);
   return { cfg, diags, graph, vars };
 }
 
 const sortChanges = (cs: ResourceChange[]) => cs.sort((a, b) => a.addr.localeCompare(b.addr, 'en', { numeric: true }));
 
-function summarize(changes: ResourceChange[]) {
-  const s = { add: 0, change: 0, destroy: 0 };
+function summarize(changes: ResourceChange[]): PlanSummary {
+  const s = { add: 0, change: 0, destroy: 0, import: 0 };
   for (const c of changes) {
     if (c.mode !== 'managed') continue;
+    if (c.importing) s.import++;
     if (c.action === 'create') s.add++;
     else if (c.action === 'update') s.change++;
     else if (c.action === 'delete') s.destroy++;
@@ -913,23 +1211,49 @@ function outputChanges(prior: TfState, outputs: PlanResult['outputs'], destroy: 
 /** terraform plan */
 export function plan(files: Record<string, string>, prior: TfState, opts: RunOptions = {}): PlanResult {
   const destroy = !!opts.destroy;
+  const refreshOnly = !!opts.refreshOnly && !destroy;
+  const cloud = opts.cloud ?? emptyCloud();
   const { cfg, diags, graph, vars } = prepare(files, opts);
   const fail = (): PlanResult => ({
     ok: false,
     destroy,
+    refreshOnly,
+    drift: [],
+    base: prior,
+    moves: [],
     diagnostics: diags,
     config: cfg,
     graph,
     changes: [],
     outputChanges: [],
     outputs: {},
-    summary: { add: 0, change: 0, destroy: 0 },
+    summary: { add: 0, change: 0, destroy: 0, import: 0 },
   });
   if (!graph || !vars || hasErrors(diags)) return fail();
 
+  // Refresh: antes de planificar, Terraform lee cada recurso real y actualiza su copia del estado.
+  // 1) moved: renombra direcciones en el estado antes de nada.
+  const moved = applyMoves(prior, cfg.moved);
+  for (const w of moved.warnings) diags.push({ severity: 'warning', summary: 'Unresolved move', detail: w, hint: 'El destino del moved ya existe en el estado: Terraform no puede renombrar encima de otro objeto.' });
+  // 2) refresh: lee cada recurso real y actualiza su copia del estado.
+  const { state: base, drift } = opts.refresh === false ? { state: cloneState(moved.state), drift: [] as DriftChange[] } : refreshState(moved.state, cloud);
+  const common = { refreshOnly, drift, base, moves: moved.moves, config: cfg, graph };
+
+  if (refreshOnly) {
+    const res = walk({ cfg, graph, vars, cur: cloneState(base), realize: false, events: [], diags, workspace: opts.workspace });
+    if (res.failed) return fail();
+    const outputs: PlanResult['outputs'] = {};
+    for (const [n, o] of Object.entries(res.outputs)) {
+      if (!containsUnknown(o.value)) outputs[n] = o;
+      else if (prior.outputs[n]) outputs[n] = prior.outputs[n];
+    }
+    base.outputs = outputs;
+    return { ok: true, destroy, ...common, diagnostics: diags, changes: [], outputChanges: outputChanges(prior, outputs, false), outputs, summary: summarize([]) };
+  }
+
   if (destroy) {
     const changes: ResourceChange[] = [];
-    for (const inst of destroyOrder(Object.values(prior.resources).filter((r) => r.mode === 'managed'))) {
+    for (const inst of destroyOrder(Object.values(base.resources).filter((r) => r.mode === 'managed'))) {
       const rc = findResource(cfg, inst.resourceAddr);
       if (rc?.lifecycle.preventDestroy) {
         diags.push({
@@ -962,9 +1286,8 @@ export function plan(files: Record<string, string>, prior: TfState, opts: RunOpt
     return {
       ok: true,
       destroy,
+      ...common,
       diagnostics: diags,
-      config: cfg,
-      graph,
       changes,
       outputChanges: outputChanges(prior, {}, true),
       outputs: {},
@@ -972,10 +1295,76 @@ export function plan(files: Record<string, string>, prior: TfState, opts: RunOpt
     };
   }
 
-  const res = walk({ cfg, graph, vars, cur: prior, realize: false, events: [], diags });
-  if (res.failed) return fail();
+  // Bloques import: el objeto real entra en el estado y se compara con su configuración.
+  const importing = new Map<string, string>();
+  for (const imp of cfg.imports) {
+    if (base.resources[imp.to]) continue; // ya gestionado: el import no hace nada
+    const rc = findResource(cfg, imp.resourceAddr)!;
+    const at = { file: imp.file, line: imp.line };
+    let id: Value;
+    try {
+      id = evalExpr(imp.id, { ...emptyScope(), vars });
+    } catch (e) {
+      if (!(e instanceof EvalError)) throw e;
+      diags.push({ severity: 'error', summary: `Invalid import id argument: ${e.message}`, hint: 'El id puede ser un texto o usar variables, pero no atributos de otros recursos.', ...at });
+      return fail();
+    }
+    if (typeof id !== 'string' || !id) {
+      diags.push({ severity: 'error', summary: 'Invalid import id argument', detail: 'The import ID must be a non-empty string.', hint: 'id es el identificador del objeto en la nube, p.ej. "mi-bucket" o "i-0abc…".', ...at });
+      return fail();
+    }
+    const obj = cloud.unmanaged[id];
+    if (!obj || obj.type !== rc.type) {
+      const owner = Object.values(base.resources).find((r) => r.attributes.id === id);
+      diags.push({
+        severity: 'error',
+        summary: 'Cannot import non-existent remote object',
+        detail: `While attempting to import an existing object to "${imp.to}", the provider detected that no object exists with the given id. Only pre-existing objects can be imported; check that the id is correct.`,
+        hint: owner
+          ? `Ese objeto ya lo gestiona Terraform como ${owner.addr}. Un objeto real solo puede estar en una dirección del estado.`
+          : obj
+            ? `El objeto "${id}" es de tipo ${obj.type}, pero ${imp.to} es de tipo ${rc.type}.`
+            : 'Usa "cloud ls" para ver los objetos que existen en la nube y sus ids.',
+        ...at,
+      });
+      return fail();
+    }
+    const schema = getSchema('managed', rc.type)!;
+    const { prefix } = splitAddr(imp.resourceAddr);
+    base.resources[imp.to] = {
+      addr: imp.to,
+      resourceAddr: imp.resourceAddr,
+      module: prefix ? prefix.slice(0, -1) : undefined,
+      mode: 'managed',
+      type: rc.type,
+      name: rc.name,
+      indexKey: imp.indexKey,
+      attributes: cloneValue(obj.attributes),
+      sensitiveAttrs: sensitiveAttrs(schema),
+      dependencies: [],
+    };
+    importing.set(imp.to, id);
+  }
 
-  for (const inst of Object.values(prior.resources)) {
+  const res = walk({ cfg, graph, vars, cur: base, realize: false, events: [], diags, unmanaged: cloud.unmanaged, workspace: opts.workspace, replace: opts.replace });
+  if (res.failed) return fail();
+  for (const [addr] of importing) {
+    if (res.expanded.has(addr)) continue;
+    const imp = cfg.imports.find((i) => i.to === addr)!;
+    diags.push({ severity: 'error', summary: 'Configuration for import target does not exist', detail: `The configuration for the given import target ${addr} does not exist.`, hint: 'Ese índice no existe con el count o for_each actual del recurso.', file: imp.file, line: imp.line });
+    return fail();
+  }
+  for (const c of res.changes) {
+    if (importing.has(c.addr)) c.importing = importing.get(c.addr);
+    const m = moved.moves.find((x) => x.to === c.addr);
+    if (m) c.movedFrom = m.from;
+  }
+  for (const r of opts.replace ?? []) {
+    if (!res.changes.some((c) => c.addr === r && c.reason === 'requested'))
+      diags.push({ severity: 'warning', summary: 'Incompletely-matched force-replace resource instance', detail: `Your force-replace request for ${r} doesn't match any resource instance that already exists.`, hint: 'Usa terraform state list para ver la dirección exacta (con count: aws_instance.web[0]).' });
+  }
+
+  for (const inst of Object.values(base.resources)) {
     if (inst.mode !== 'managed' || res.expanded.has(inst.addr)) continue;
     res.changes.push({
       addr: inst.addr,
@@ -997,9 +1386,8 @@ export function plan(files: Record<string, string>, prior: TfState, opts: RunOpt
   return {
     ok: true,
     destroy,
+    ...common,
     diagnostics: diags,
-    config: cfg,
-    graph,
     changes: sortChanges(res.changes),
     outputChanges: outputChanges(prior, res.outputs, false),
     outputs: res.outputs,
@@ -1010,11 +1398,35 @@ export function plan(files: Record<string, string>, prior: TfState, opts: RunOpt
 /** terraform apply (o destroy si opts.destroy). */
 export function apply(files: Record<string, string>, prior: TfState, opts: RunOptions = {}): ApplyResult {
   const p = plan(files, prior, opts);
-  if (!p.ok) return { ...p, state: prior, events: [], applied: false };
+  const cloud = opts.cloud ?? emptyCloud();
+  if (!p.ok) return { ...p, state: prior, events: [], applied: false, cloud, applyWarnings: [] };
 
-  const working = cloneState(prior);
+  // La nube tras el apply: el refresh absorbe los cambios manuales y los imports dejan de ser "no gestionados".
+  let nextCloud: CloudChanges = opts.refresh === false ? { ...cloud, modified: { ...cloud.modified }, deleted: [...cloud.deleted] } : afterRefresh(cloud);
+  const imported = p.changes.filter((c) => c.importing);
+  nextCloud = { ...nextCloud, unmanaged: Object.fromEntries(Object.entries(nextCloud.unmanaged).filter(([id]) => !imported.some((c) => c.importing === id))) };
+  if (opts.refresh === false) {
+    for (const c of p.changes) {
+      const id = c.before?.id;
+      if (c.action === 'noop' || typeof id !== 'string') continue;
+      delete nextCloud.modified[id];
+      nextCloud.deleted = nextCloud.deleted.filter((x) => x !== id);
+    }
+  }
+
+  if (p.refreshOnly) {
+    const st = cloneState(p.base);
+    st.serial++;
+    return { ...p, state: st, events: [], applied: true, cloud: nextCloud, applyWarnings: [] };
+  }
+
+  const working = cloneState(p.base);
   const events: ApplyEvent[] = [];
   const diags = [...p.diagnostics];
+  for (const c of imported) {
+    events.push({ kind: 'start', addr: c.addr, phase: 'importing', id: c.importing, seconds: 0, state: cloneState(working) });
+    events.push({ kind: 'complete', addr: c.addr, phase: 'importing', id: c.importing, seconds: 0, state: cloneState(working) });
+  }
 
   const destroyNow = p.changes.filter((c) => c.action === 'delete' || (c.action === 'replace' && !c.createBeforeDestroy));
   const insts = destroyOrder(destroyNow.map((c) => working.resources[c.addr]).filter(Boolean));
@@ -1028,23 +1440,24 @@ export function apply(files: Record<string, string>, prior: TfState, opts: RunOp
     working.resources = {};
     working.outputs = {};
     working.serial++;
-    return { ...p, diagnostics: diags, state: working, events, applied: true };
+    return { ...p, diagnostics: diags, state: working, events, applied: true, cloud: nextCloud, applyWarnings: [] };
   }
 
   const cfg = p.config;
   const graph = p.graph!;
   const vars = prepare(files, opts).vars!;
-  const res = walk({ cfg, graph, vars, cur: working, realize: true, events, diags });
+  const res = walk({ cfg, graph, vars, cur: working, realize: true, events, diags, unmanaged: nextCloud.unmanaged, workspace: opts.workspace, replace: opts.replace });
+  const applyWarnings = diags.slice(p.diagnostics.length).filter((d) => d.severity === 'warning');
   working.serial++;
   if (res.failed) {
-    return { ...p, ok: false, diagnostics: diags, state: working, events, applied: true };
+    return { ...p, ok: false, diagnostics: diags, state: working, events, applied: true, cloud: nextCloud, applyWarnings };
   }
   // Quitar data sources que ya no están en la configuración.
   for (const inst of Object.values(working.resources)) {
     if (inst.mode === 'data' && !res.expanded.has(inst.addr)) delete working.resources[inst.addr];
   }
   working.outputs = res.outputs;
-  return { ...p, diagnostics: diags, outputs: res.outputs, state: working, events, applied: true };
+  return { ...p, diagnostics: diags, outputs: res.outputs, state: working, events, applied: true, cloud: nextCloud, applyWarnings };
 }
 
 /** terraform validate: sintaxis, esquema y referencias, sin evaluar valores. */
@@ -1052,15 +1465,21 @@ export function validate(files: Record<string, string>, modules?: InstalledModul
   const cfg = loadConfig(files, modules);
   if (hasErrors(cfg.diagnostics)) return { diagnostics: cfg.diagnostics, config: cfg, graph: null };
   const graph = buildGraph(cfg);
-  return { diagnostics: [...cfg.diagnostics, ...graph.diagnostics], config: cfg, graph };
+  return { diagnostics: [...cfg.diagnostics, ...graph.diagnostics, ...(hasErrors(graph.diagnostics) ? [] : semanticChecks(cfg))], config: cfg, graph };
 }
 
 /** terraform console: evalúa una expresión con las variables, locals y recursos actuales. */
-export function consoleEval(files: Record<string, string>, state: TfState, source: string, modules?: InstalledModules): { value?: Value; error?: Diagnostic } {
-  const { cfg, diags, graph, vars } = prepare(files, { modules });
-  let scope: Scope = { ...emptyScope(), vars: vars ?? {} };
+export function consoleEval(
+  files: Record<string, string>,
+  state: TfState,
+  source: string,
+  modules?: InstalledModules,
+  opts: { env?: Record<string, string>; workspace?: string } = {},
+): { value?: Value; error?: Diagnostic; sensitive?: boolean } {
+  const { cfg, diags, graph, vars } = prepare(files, { modules, env: opts.env, workspace: opts.workspace });
+  let scope: Scope = { ...emptyScope(), vars: vars ?? {}, workspace: opts.workspace ?? 'default' };
   if (graph && vars && !hasErrors(diags)) {
-    const res = walk({ cfg, graph, vars, cur: cloneState(state), realize: false, events: [], diags: [] });
+    const res = walk({ cfg, graph, vars, cur: cloneState(state), realize: false, events: [], diags: [], workspace: opts.workspace });
     scope = res.scope;
   }
   // Igual que Terraform: los recursos se leen del estado, no del código sin aplicar.
@@ -1079,7 +1498,7 @@ export function consoleEval(files: Record<string, string>, state: TfState, sourc
   }
   try {
     const expr = parseExpressionSource(source, 1);
-    return { value: evalExpr(expr, scope) };
+    return { value: evalExpr(expr, scope), sensitive: isSensitiveExpr(expr, cfg) };
   } catch (e) {
     if (e instanceof EvalError) return { error: { severity: 'error', summary: e.message, hint: e.hint } };
     if (e instanceof Error && 'line' in e) return { error: { severity: 'error', summary: e.message, hint: (e as { hint?: string }).hint } };

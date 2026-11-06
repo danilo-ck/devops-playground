@@ -42,6 +42,16 @@ export interface LearningModule {
   lessons: LessonMeta[];
   /** Componente que renderiza el espacio de trabajo interactivo de una lección. */
   LessonView?: ComponentType<LessonViewProps>;
+  /** Modo examen / preparación de certificación (opcional). Se sirve en /m/<id>/examen. */
+  exam?: ModuleExam;
+}
+
+export interface ModuleExam {
+  title: string;
+  summary: string;
+  View: ComponentType<{ moduleId: string }>;
+  /** Mejor nota guardada (0–100) para mostrarla en la página del módulo. */
+  bestScore?: () => number | null;
 }
 
 /** Un objetivo verificable de una lección. `T` es el contexto propio del módulo. */

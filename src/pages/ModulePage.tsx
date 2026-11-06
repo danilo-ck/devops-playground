@@ -13,6 +13,7 @@ export function ModulePage() {
   const free = mod.lessons.filter((l) => l.freeform);
   const done = path.filter((l) => completed[`${mod.id}/${l.id}`]).length;
   const nextLesson = path.find((l) => !completed[`${mod.id}/${l.id}`]) ?? path[0];
+  const examBest = mod.exam?.bestScore?.() ?? null;
 
   return (
     <div className="page" style={{ ['--mod' as string]: mod.accent }}>
@@ -46,6 +47,38 @@ export function ModulePage() {
           </div>
         </div>
       </section>
+
+      {mod.exam && (
+        <Link
+          to={`/m/${mod.id}/examen`}
+          className="path-card"
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '1em',
+            flexWrap: 'wrap',
+            marginTop: '1.5em',
+            borderColor: 'var(--accent)',
+            background: 'linear-gradient(135deg, var(--accent-soft), var(--panel) 60%)',
+          }}
+        >
+          <span style={{ fontSize: '2.2em' }} aria-hidden>
+            🎓
+          </span>
+          <div style={{ flex: '1 1 260px', minWidth: 0 }}>
+            <h3>{mod.exam.title}</h3>
+            <p className="muted">{mod.exam.summary}</p>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.8em', flexWrap: 'wrap' }}>
+            {examBest !== null && (
+              <span className="pill" title="Mejor nota en un simulacro completo">
+                Mejor nota: {examBest}%
+              </span>
+            )}
+            <span className="btn btn-primary">Ir al examen →</span>
+          </div>
+        </Link>
+      )}
 
       <h2 className="section-title">Ruta de aprendizaje</h2>
       <ol className="path">

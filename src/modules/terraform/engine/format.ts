@@ -1,3 +1,4 @@
+import type { DriftChange } from './cloud';
 import { findResource, type Diagnostic } from './config';
 import type { ApplyEvent, PlanResult, ResourceChange } from './evaluate';
 import type { InstanceState, TfState } from './state';
@@ -54,7 +55,7 @@ function fmt(v: Value | undefined, name: string, sensitive: string[]) {
 }
 
 function changeBlock(c: ResourceChange, cfgHas: (addr: string) => boolean): TermLine[] {
-  const s = SYMBOL[c.action];
+  const s = SYMBOL[c.action] ?? { sym: '   ', tone: 'muted', legend: '' };
   const out: TermLine[] = [];
   const kind = c.mode === 'data' ? 'data' : 'resource';
   const head = `${s.sym} ${kind} "${c.type}" "${c.name}" {`;
@@ -66,7 +67,28 @@ function changeBlock(c: ResourceChange, cfgHas: (addr: string) => boolean): Term
     read: 'will be read during apply',
     noop: '',
   }[c.action];
-  out.push(L(''), L(`  # ${c.addr} ${comment}`, 'bold'));
+  if (c.importing && c.action === 'noop') {
+    out.push(L(''), L(`  # ${c.addr} will be imported`, 'bold'), L(`    resource "${c.type}" "${c.name}" {`), L(`        id = ${formatHcl(c.importing)}`, 'muted'), L('    }'));
+    return out;
+  }
+  if (c.movedFrom && c.action === 'noop') {
+    const hidden = Object.entries(c.before ?? {}).filter(([n, v]) => n !== 'id' && !isEmpty(v)).length;
+    out.push(
+      L(''),
+      L(`  # ${c.movedFrom} has moved to ${c.addr}`, 'bold'),
+      L(`    resource "${c.type}" "${c.name}" {`),
+      L(`        id = ${formatHcl(c.before?.id)}`, 'muted'),
+      ...(hidden ? [L(`        # (${hidden} unchanged attributes hidden)`, 'muted')] : []),
+      L('    }'),
+    );
+    return out;
+  }
+  const title =
+    c.reason === 'requested' ? 'will be replaced, as requested' : c.reason === 'tainted' ? 'is tainted, so must be replaced' : comment;
+  out.push(L(''), L(`  # ${c.addr} ${title}`, 'bold'));
+  if (c.movedFrom) out.push(L(`  # (moved from ${c.movedFrom})`, 'muted'));
+  if (c.importing) out.push(L(`  # (imported from "${c.importing}")`, 'muted'));
+  if (c.writeOnlyAttrs?.length) out.push(L(`  # (write-only: ${c.writeOnlyAttrs.join(', ')} se envía al proveedor pero no se guarda en el plan ni en el estado)`, 'muted'));
   if (c.action === 'delete') {
     if (!cfgHas(c.resourceAddr)) out.push(L(`  # (because ${c.resourceAddr} is not in configuration)`, 'muted'));
     else if (c.indexKey !== undefined) out.push(L(`  # (because index ${typeof c.indexKey === 'number' ? `[${c.indexKey}] is out of range for count` : `["${c.indexKey}"] is not in for_each map`})`, 'muted'));
@@ -127,11 +149,66 @@ function renderOutputChanges(p: PlanResult): TermLine[] {
   return out;
 }
 
+/** "Objects have changed outside of Terraform": lo que el refresh ha encontrado. */
+export function renderDrift(drift: DriftChange[], refreshOnly: boolean): TermLine[] {
+  if (!drift.length) return [];
+  const out: TermLine[] = [
+    L(''),
+    L(refreshOnly ? 'Terraform detected the following changes made outside of Terraform since the last "terraform apply":' : 'Note: Objects have changed outside of Terraform', 'bold'),
+  ];
+  if (!refreshOnly) out.push(L(''), L('Terraform detected the following changes made outside of Terraform since the last "terraform apply" which may have affected this plan:'));
+  for (const d of drift) {
+    out.push(L(''));
+    if (d.action === 'delete') {
+      out.push(L(`  # ${d.addr} has been deleted`, 'bold'), L(`  - resource "${d.type}" "${d.name}" {`, 'destroy'), L(`      - id = ${formatHcl(d.id)} -> null`, 'destroy'), L('    }', 'destroy'));
+      continue;
+    }
+    out.push(L(`  # ${d.addr} has changed`, 'bold'), L(`  ~ resource "${d.type}" "${d.name}" {`, 'change'), L(`        id = ${formatHcl(d.id)}`, 'muted'));
+    for (const x of d.diffs) {
+      if (isMap(x.before) || isMap(x.after)) {
+        const b = (isMap(x.before) ? x.before : {}) as ValueMap;
+        const a = (isMap(x.after) ? x.after : {}) as ValueMap;
+        out.push(L(`      ~ ${x.name} = {`, 'change'));
+        for (const k of [...new Set([...Object.keys(b), ...Object.keys(a)])].sort()) {
+          if (!(k in a)) out.push(L(`          - "${k}" = ${formatHcl(b[k])} -> null`, 'destroy'));
+          else if (!(k in b)) out.push(L(`          + "${k}" = ${formatHcl(a[k])}`, 'add'));
+          else if (formatHcl(a[k]) !== formatHcl(b[k])) out.push(L(`          ~ "${k}" = ${formatHcl(b[k])} -> ${formatHcl(a[k])}`, 'change'));
+        }
+        out.push(L('        }', 'change'));
+      } else out.push(L(`      ~ ${x.name} = ${formatHcl(x.before)} -> ${formatHcl(x.after)}`, 'change'));
+    }
+    out.push(L('    }', 'change'));
+  }
+  out.push(L(''));
+  if (refreshOnly)
+    out.push(L('This is a refresh-only plan, so Terraform will not take any actions to undo these. If you were expecting these changes then you can apply this plan to record the updated values in the Terraform state without changing any remote objects.', 'muted'));
+  else
+    out.push(L('Unless you have made equivalent changes to your configuration, or ignored the relevant attributes using ignore_changes, the following plan may include actions to undo or respond to these changes.', 'muted'));
+  if (!refreshOnly) out.push(L(''), L('─'.repeat(77), 'muted'));
+  return out;
+}
+
+/** "aws_instance.web: Refreshing state... [id=i-…]" */
+export function renderRefreshing(p: PlanResult, prior: TfState): TermLine[] {
+  return Object.values(prior.resources)
+    .filter((r) => r.mode === 'managed' && r.attributes.id)
+    .sort((a, b) => a.addr.localeCompare(b.addr, 'en', { numeric: true }))
+    .map((r) => L(`${r.addr}: Refreshing state... [id=${String(r.attributes.id)}]`, 'muted'));
+}
+
 export function renderPlan(p: PlanResult): TermLine[] {
   if (!p.ok) return renderDiagnostics(p.diagnostics);
   const out: TermLine[] = [...renderDiagnostics(p.diagnostics.filter((d) => d.severity === 'warning'))];
-  const actionable = p.changes.filter((c) => c.action !== 'noop');
+  out.push(...renderDrift(p.drift, p.refreshOnly));
+  const actionable = p.changes.filter((c) => c.action !== 'noop' || c.importing || c.movedFrom);
   const outCh = p.outputChanges.filter((o) => o.action !== 'noop');
+  if (p.refreshOnly) {
+    if (!p.drift.length) {
+      out.push(L(''), L('No changes. Your infrastructure still matches the configuration.', 'success'), L(''), L('Terraform has checked that the real remote objects still match the result of your most recent changes, and found no differences.', 'muted'));
+    }
+    out.push(...renderOutputChanges(p));
+    return out;
+  }
   if (!actionable.length) {
     if (outCh.length) {
       out.push(...renderOutputChanges(p));
@@ -148,11 +225,11 @@ export function renderPlan(p: PlanResult): TermLine[] {
   }
   out.push(L(''), L('Terraform used the selected providers to generate the following execution plan. Resource actions are indicated with the following symbols:'));
   const used = new Set(actionable.map((c) => c.action));
-  for (const a of ['create', 'update', 'replace', 'delete', 'read']) if (used.has(a as never)) out.push(L(`${SYMBOL[a].sym} ${SYMBOL[a].legend}`, SYMBOL[a].tone));
+  for (const a of ['create', 'update', 'replace', 'delete', 'read']) if (used.has(a as never) && a !== 'noop') out.push(L(`${SYMBOL[a].sym} ${SYMBOL[a].legend}`, SYMBOL[a].tone));
   out.push(L(''), L('Terraform will perform the following actions:'));
   const cfgHas = (addr: string) => !!findResource(p.config, addr) && !p.destroy;
   for (const c of actionable) out.push(...changeBlock(c, cfgHas));
-  out.push(L(''), L(`Plan: ${p.summary.add} to add, ${p.summary.change} to change, ${p.summary.destroy} to destroy.`, 'bold'));
+  out.push(L(''), L(`Plan: ${p.summary.import ? `${p.summary.import} to import, ` : ''}${p.summary.add} to add, ${p.summary.change} to change, ${p.summary.destroy} to destroy.`, 'bold'));
   out.push(...renderOutputChanges(p));
   return out;
 }
@@ -170,6 +247,8 @@ export function renderApplyEvent(e: ApplyEvent): TermLine | null {
         return L(`${e.addr}: Destroying...${e.message === 'deposed' ? ` (deposed object)` : ''}${id}`, 'destroy');
       case 'reading':
         return L(`${e.addr}: Reading...`, 'read');
+      case 'importing':
+        return L(`${e.addr}: Importing...${id}`, 'info');
     }
   }
   switch (e.phase) {
@@ -179,6 +258,8 @@ export function renderApplyEvent(e: ApplyEvent): TermLine | null {
       return L(`${e.addr}: Modifications complete after ${e.seconds}s${id}`, 'change');
     case 'destroying':
       return L(`${e.addr}: Destruction complete after ${e.seconds}s`, 'destroy');
+    case 'importing':
+      return L(`${e.addr}: Import complete${id}`, 'info');
     default:
       return L(`${e.addr}: Read complete after 0s${id}`, 'read');
   }

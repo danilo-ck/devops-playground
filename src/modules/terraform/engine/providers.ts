@@ -18,6 +18,8 @@ export interface ArgSpec {
   description: string;
   /** Opcional, pero si no se indica lo calcula el proveedor al crear el recurso. */
   computed?: boolean;
+  /** Write-only (Terraform >= 1.11): se envía al proveedor pero nunca se guarda en el plan ni en el estado. */
+  writeOnly?: boolean;
   /** Para argumentos de tipo bloque: su esquema interno. */
   block?: Record<string, ArgSpec>;
 }
@@ -60,6 +62,16 @@ export interface ProviderInfo {
   version: string;
   description: string;
 }
+
+/** Versión de Terraform que simula la app. */
+export const TF_VERSION = '1.12.2';
+
+/** Versiones publicadas de cada proveedor en el registro simulado (de más antigua a más nueva). */
+export const PROVIDER_VERSIONS: Record<string, string[]> = {
+  aws: ['4.67.0', '5.31.0', '5.72.1', '6.0.0'],
+  random: ['3.5.1', '3.6.3', '3.7.2'],
+  local: ['2.4.1', '2.5.2'],
+};
 
 export const PROVIDERS: Record<string, ProviderInfo> = {
   aws: { name: 'aws', source: 'hashicorp/aws', version: '5.72.1', description: 'Amazon Web Services' },
@@ -367,7 +379,9 @@ const schemas: ResourceSchema[] = [
       allocated_storage: { type: 'number', required: true, description: 'Almacenamiento en GB' },
       db_name: { type: 'string', forceNew: true, description: 'Nombre de la base de datos inicial' },
       username: { type: 'string', forceNew: true, description: 'Usuario administrador' },
-      password: { type: 'string', sensitive: true, description: 'Contraseña del administrador' },
+      password: { type: 'string', sensitive: true, description: 'Contraseña del administrador (se guarda en el estado)' },
+      password_wo: { type: 'string', sensitive: true, writeOnly: true, description: 'Contraseña write-only: admite valores ephemeral y nunca se guarda en el estado' },
+      password_wo_version: { type: 'number', description: 'Cámbialo para que Terraform vuelva a enviar password_wo' },
       publicly_accessible: { type: 'bool', default: false, description: 'Accesible desde Internet' },
       skip_final_snapshot: { type: 'bool', default: false, description: 'No crear snapshot al destruir' },
       vpc_security_group_ids: { type: 'list', description: 'Security groups' },

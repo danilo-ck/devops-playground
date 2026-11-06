@@ -39,6 +39,8 @@
   --c-local: #e3b341;
   --c-output: #ff7eb6;
   --c-module: #2dd4bf;
+  --drift: #f778ba;
+  --drift-soft: rgba(247, 120, 186, 0.13);
   --edge: #4a5a85;
 
   --radius: 10px;
@@ -2087,7 +2089,7 @@ h4 {
 }
 .plan-summary {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
   gap: 0.5em;
   margin-bottom: 1em;
 }
@@ -2562,4 +2564,137 @@ h4 {
 .reg-versions button.active {
   border-color: var(--c-module);
   color: var(--c-module);
+}
+
+/* drift: cambios hechos fuera de Terraform */
+.drift-tag {
+  display: inline-block;
+  font-size: 0.66em;
+  font-weight: 700;
+  font-family: var(--mono);
+  padding: 0.05em 0.45em;
+  border-radius: 4px;
+  white-space: nowrap;
+  background: var(--drift-soft);
+  color: var(--drift);
+  border: 1px solid var(--drift);
+  margin-top: 0.25em;
+}
+.box-head .drift-tag {
+  margin-top: 0;
+}
+.dr-drifted {
+  border-color: var(--drift) !important;
+  box-shadow: 0 0 0 3px var(--drift-soft);
+}
+.dr-unmanaged {
+  border-style: dashed !important;
+  border-color: var(--drift) !important;
+  background: repeating-linear-gradient(135deg, transparent 0 8px, var(--drift-soft) 8px 16px) !important;
+}
+.dr-deleted {
+  border-style: dotted !important;
+  border-color: var(--drift) !important;
+  opacity: 0.45;
+}
+.dr-deleted .rcard-title {
+  text-decoration: line-through;
+}
+.st-import {
+  border-style: dashed !important;
+  border-color: var(--info) !important;
+  background: rgba(88, 166, 255, 0.1) !important;
+}
+.stt-import {
+  background: var(--info);
+  color: #041222;
+}
+.lg-drift::before {
+  border-color: var(--drift);
+  box-shadow: 0 0 0 2px var(--drift-soft);
+}
+.lg-unmanaged::before {
+  border: 1.5px dashed var(--drift);
+}
+.lg-import::before {
+  border: 1.5px dashed var(--info);
+}
+.drift-note {
+  color: var(--drift);
+  margin: 0.3em 0;
+}
+.dg-v.dg-drift {
+  color: var(--drift);
+  font-weight: 600;
+}
+.drift-box {
+  border: 1px solid var(--drift);
+  background: var(--drift-soft);
+  border-radius: var(--radius-sm);
+  padding: 0.7em 0.9em;
+  margin-bottom: 1em;
+}
+.drift-box h4 {
+  margin: 0 0 0.3em;
+  color: var(--drift);
+}
+.drift-item {
+  margin-top: 0.6em;
+}
+.banner.info {
+  border-color: var(--info);
+  background: rgba(88, 166, 255, 0.1);
+}
+.ps-import strong {
+  color: var(--info);
+}
+.change-import {
+  border-color: var(--info);
+}
+.change-import .change-sym {
+  color: var(--info);
+}
+.import-chip {
+  font-size: 0.72em;
+  font-family: var(--mono);
+  color: var(--info);
+  border: 1px solid var(--info);
+  border-radius: 4px;
+  padding: 0 0.4em;
+  margin-left: auto;
+}
+
+/* contexto de la sesión en la cabecera de las vistas */
+.session-chips {
+  margin-left: auto;
+  display: flex;
+  gap: 0.35em;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 0 0.5em;
+}
+.schip {
+  font-family: var(--mono);
+  font-size: 0.7em;
+  padding: 0.1em 0.5em;
+  border-radius: 999px;
+  border: 1px solid var(--border-2);
+  color: var(--text-2);
+  white-space: nowrap;
+}
+.schip-ws {
+  border-color: var(--accent);
+  color: var(--accent-2);
+}
+.schip-be {
+  border-color: var(--info);
+  color: var(--info);
+}
+.schip-lock {
+  border-color: var(--destroy);
+  color: var(--destroy);
+}
+.schip-log {
+  border-color: var(--change);
+  color: var(--change);
 }

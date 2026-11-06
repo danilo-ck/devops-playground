@@ -1,5 +1,6 @@
 import { parseHcl, type Attribute, type Body, type Expr } from './parser';
-import { getSchema, PROVIDERS, providerOf, RESOURCE_SCHEMAS, DATA_SCHEMAS, suggest, type ArgSpec } from './providers';
+import { getSchema, PROVIDERS, providerOf, RESOURCE_SCHEMAS, DATA_SCHEMAS, suggest, TF_VERSION, type ArgSpec } from './providers';
+import type { Value } from './values';
 import { isLocalSource, isRegistrySource, isValidConstraint, joinPath, REGISTRY, resolveVersion, satisfies } from './registry';
 
 export interface Diagnostic {
@@ -10,6 +11,14 @@ export interface Diagnostic {
   hint?: string;
   file?: string;
   line?: number;
+}
+
+/** precondition / postcondition / assert: condición + mensaje de error. */
+export interface Condition {
+  condition: Expr;
+  errorMessage: Expr;
+  file: string;
+  line: number;
 }
 
 export interface ResourceConfig {
@@ -23,6 +32,10 @@ export interface ResourceConfig {
   forEach?: Expr;
   dependsOn: string[];
   lifecycle: { preventDestroy: boolean; createBeforeDestroy: boolean; ignoreChanges: string[] };
+  /** Configuración de proveedor que usa: "aws" o "aws.virginia" (meta-argumento provider). */
+  provider: string;
+  preconditions: Condition[];
+  postconditions: Condition[];
   file: string;
   line: number;
 }
@@ -33,6 +46,8 @@ export interface VariableConfig {
   default?: Expr;
   description?: string;
   sensitive: boolean;
+  /** ephemeral = true: el valor nunca se guarda en el plan ni en el estado. */
+  ephemeral: boolean;
   validations: { condition: Expr; errorMessage: string; line: number }[];
   file: string;
   line: number;
@@ -43,6 +58,8 @@ export interface OutputConfig {
   value: Expr;
   description?: string;
   sensitive: boolean;
+  ephemeral: boolean;
+  preconditions: Condition[];
   file: string;
   line: number;
 }
@@ -56,6 +73,8 @@ export interface LocalConfig {
 
 export interface ProviderConfig {
   name: string;
+  /** alias = "virginia" → se usa como provider = aws.virginia */
+  alias?: string;
   body: Body;
   file: string;
   line: number;
@@ -79,6 +98,53 @@ export interface ModuleCallConfig {
   line: number;
 }
 
+/** terraform { backend "s3" { ... } } */
+export interface BackendConfig {
+  type: string;
+  attrs: Record<string, Value>;
+  file: string;
+  line: number;
+}
+
+/** terraform { cloud { organization = "..." workspaces { name = "..." } } } */
+export interface CloudBlockConfig {
+  organization?: string;
+  hostname: string;
+  workspaceName?: string;
+  workspaceTags?: string[];
+  project?: string;
+  file: string;
+  line: number;
+}
+
+/** moved { from = aws_instance.a  to = aws_instance.b } */
+export interface MovedConfig {
+  from: string;
+  to: string;
+  file: string;
+  line: number;
+}
+
+/** check "nombre" { assert { condition = ...  error_message = "..." } } */
+export interface CheckConfig {
+  name: string;
+  asserts: Condition[];
+  file: string;
+  line: number;
+}
+
+/** Bloque import { to = aws_s3_bucket.logs  id = "mi-bucket" } (Terraform >= 1.5). */
+export interface ImportConfig {
+  /** Dirección de la instancia destino: aws_s3_bucket.logs, aws_instance.web[0], module.x.aws_vpc.this */
+  to: string;
+  /** Dirección del recurso (sin índice). */
+  resourceAddr: string;
+  indexKey?: string | number;
+  id: Expr;
+  file: string;
+  line: number;
+}
+
 /** Versión instalada por `terraform init` para cada llamada a módulo. */
 export type InstalledModules = Record<string, { source: string; version: string }>;
 
@@ -92,6 +158,13 @@ export interface Config {
   providers: ProviderConfig[];
   requiredProviders: Record<string, { source?: string; version?: string }>;
   moduleCalls: Record<string, ModuleCallConfig>;
+  /** Bloques import (solo en el módulo raíz). */
+  imports: ImportConfig[];
+  moved: MovedConfig[];
+  checks: CheckConfig[];
+  requiredVersion?: { constraint: string; file: string; line: number };
+  backend?: BackendConfig;
+  cloud?: CloudBlockConfig;
   children: Record<string, Config>;
   /** En el módulo raíz incluye también los diagnósticos de todos los hijos. */
   diagnostics: Diagnostic[];
@@ -160,6 +233,35 @@ function validateArgs(
   }
   for (const b of body.blocks) {
     if (allowMeta && (b.type === 'lifecycle' || b.type === 'provisioner' || b.type === 'connection')) continue;
+    if (b.type === 'dynamic') {
+      const label = b.labels[0];
+      const spec = label ? args[label] : undefined;
+      const blockNames = Object.entries(args).filter(([, a]) => a.type === 'block').map(([n]) => n);
+      if (!spec || spec.type !== 'block') {
+        diags.push({
+          severity: 'error',
+          summary: 'Unsupported block type',
+          detail: `Blocks of type "${label ?? ''}" are not expected here.`,
+          hint: blockNames.length
+            ? `dynamic "<tipo>" genera bloques anidados del recurso. ${where} admite: ${blockNames.join(', ')}.`
+            : `${where} no tiene bloques anidados que generar con dynamic.`,
+          file,
+          line: b.line,
+        });
+        continue;
+      }
+      const content = b.body.blocks.find((x) => x.type === 'content');
+      if (!b.body.attributes.some((a) => a.name === 'for_each'))
+        diags.push({ severity: 'error', summary: 'Missing required argument', detail: 'The argument "for_each" is required, but no definition was found.', hint: 'Un bloque dynamic necesita for_each con la colección a recorrer.', file, line: b.line });
+      if (!content)
+        diags.push({ severity: 'error', summary: 'Missing required block', detail: 'A block of type "content" is required here.', hint: `Dentro de dynamic va un bloque content { ... } con los argumentos de cada ${label}.`, file, line: b.line });
+      for (const a of b.body.attributes)
+        if (!['for_each', 'iterator', 'labels'].includes(a.name))
+          diags.push({ severity: 'error', summary: 'Unsupported argument', detail: `An argument named "${a.name}" is not expected here.`, hint: 'dynamic solo admite for_each, iterator y el bloque content.', file, line: a.line });
+      present.add(label);
+      if (content) validateArgs(content.body, spec.block ?? {}, `el bloque "${label}"`, file, diags, false, content.line);
+      continue;
+    }
     const spec = args[b.type];
     if (!spec || spec.type !== 'block') {
       diags.push({
@@ -204,7 +306,71 @@ interface LoadCtx {
 export function loadConfig(files: Record<string, string>, installed: InstalledModules = {}): Config {
   const ctx: LoadCtx = { allFiles: files, installed, diags: [] };
   const rootFiles = Object.fromEntries(Object.entries(files).filter(([f]) => !f.includes('/')));
-  return loadModule(rootFiles, ctx, '', '', 0);
+  const root = loadModule(rootFiles, ctx, '', '', 0);
+  for (const c of Object.values(moduleConfigs(root))) {
+    for (const r of Object.values(c.resources)) {
+      if (!r.provider.includes('.')) continue;
+      const [name, alias] = r.provider.split('.');
+      if (!root.providers.some((p) => p.name === name && p.alias === alias))
+        ctx.diags.push({
+          severity: 'error',
+          summary: 'Provider configuration not present',
+          detail: `To work with ${c.prefix}${r.addr} its original provider configuration at provider["registry.terraform.io/hashicorp/${name}"].${alias} is required, but it has been removed.`,
+          hint: `Declara provider "${name}" { alias = "${alias}" ... } en el módulo raíz.`,
+          file: r.file,
+          line: r.line,
+        });
+    }
+  }
+  for (const m of root.moved) {
+    const toCfg = m.to.startsWith('module.') && !/\.(aws|random|local)_/.test(m.to) ? undefined : findResource(root, m.to.replace(/\[[^\]]*\]$/, ''));
+    if (findResource(root, m.from.replace(/\[[^\]]*\]$/, '')))
+      ctx.diags.push({ severity: 'error', summary: 'Moved object still exists', detail: `This statement declares a move from ${m.from}, but that resource is still declared in configuration.`, hint: `Al renombrar, el bloque resource debe llamarse ya como el destino (${m.to}); from es el nombre antiguo.`, file: m.file, line: m.line });
+    else if (!toCfg && !m.to.startsWith('module.'))
+      ctx.diags.push({ severity: 'error', summary: 'Moved target does not exist', detail: `The move target ${m.to} is not declared in configuration.`, hint: `Declara el recurso ${m.to} (el nombre nuevo).`, file: m.file, line: m.line });
+  }
+  for (const imp of root.imports) {
+    const rc = findResource(root, imp.resourceAddr);
+    if (rc && rc.mode === 'managed') {
+      if (imp.indexKey !== undefined && !rc.count && !rc.forEach)
+        ctx.diags.push({ severity: 'error', summary: 'Invalid import address', detail: `${imp.resourceAddr} does not use count or for_each, so the address cannot have an index.`, hint: `Quita el índice: to = ${imp.resourceAddr}`, file: imp.file, line: imp.line });
+      continue;
+    }
+    const [type, name] = imp.resourceAddr.replace(/^(module.[^.]+.)*/, '').split('.');
+    ctx.diags.push({
+      severity: 'error',
+      summary: 'Configuration for import target does not exist',
+      detail: `The configuration for the given import ${imp.to} does not exist. All target instances must have an associated configuration to be imported.`,
+      hint: `Declara el bloque resource "${type}" "${name}" { ... } con los mismos valores que el objeto real, o deja que Terraform lo escriba por ti: terraform plan -generate-config-out=generated.tf`,
+      file: imp.file,
+      line: imp.line,
+    });
+  }
+  return root;
+}
+
+/** Convierte la expresión de "to" (aws_instance.web[0]) en una dirección. */
+export function exprToInstanceAddr(e: Expr): { to: string; resourceAddr: string; indexKey?: string | number } | undefined {
+  const parts: string[] = [];
+  let indexKey: string | number | undefined;
+  let cur: Expr = e;
+  if (cur.kind === 'index') {
+    if (cur.key.kind !== 'literal' || (typeof cur.key.value !== 'number' && typeof cur.key.value !== 'string')) return undefined;
+    indexKey = cur.key.value;
+    cur = cur.target;
+  }
+  while (cur.kind === 'getattr') {
+    parts.unshift(cur.name);
+    cur = cur.target;
+  }
+  if (cur.kind !== 'variable') return undefined;
+  parts.unshift(cur.name);
+  const mods: string[] = [];
+  while (parts[0] === 'module' && parts.length > 2) mods.push(`module.${parts.splice(0, 2)[1]}.`);
+  if (parts.length !== 2 || parts[0] === 'data' || parts[0] === 'var' || parts[0] === 'local') return undefined;
+  const resourceAddr = mods.join('') + parts.join('.');
+  const to = indexKey === undefined ? resourceAddr : typeof indexKey === 'number' ? `${resourceAddr}[${indexKey}]` : `${resourceAddr}["${indexKey}"]`;
+  return { to, resourceAddr, indexKey };
 }
 
 function loadModule(files: Record<string, string>, ctx: LoadCtx, prefix: string, dir: string, depth: number): Config {
@@ -217,6 +383,9 @@ function loadModule(files: Record<string, string>, ctx: LoadCtx, prefix: string,
     providers: [],
     requiredProviders: {},
     moduleCalls: {},
+    imports: [],
+    moved: [],
+    checks: [],
     children: {},
     diagnostics: ctx.diags,
   };
@@ -278,12 +447,16 @@ function loadModule(files: Record<string, string>, ctx: LoadCtx, prefix: string,
 
       switch (b.type) {
         case 'terraform': {
+          parseTerraformBlock(b, cfg, file, diags, !prefix);
           const rp = b.body.blocks.find((x) => x.type === 'required_providers');
           for (const a of rp?.body.attributes ?? []) {
             const obj = a.expr.kind === 'object' ? a.expr : undefined;
             const get = (k: string) =>
-              literalString(obj?.items.find((i) => i.key.kind === 'literal' && i.key.value === k)?.value);
+              literalString(obj?.items.find((i) => (i.key.kind === 'literal' || i.key.kind === 'variable') && ((i.key as { value?: unknown }).value ?? (i.key as { name?: string }).name) === k)?.value);
             cfg.requiredProviders[a.name] = { source: get('source'), version: get('version') };
+            const v = get('version');
+            if (v !== undefined && !isValidConstraint(v))
+              diags.push({ severity: 'error', summary: 'Invalid version constraint', detail: `"${v}" is not a valid version constraint.`, hint: 'Ejemplos: "~> 5.0", ">= 5.30, < 6.0", "5.72.1".', file, line: a.line });
             if (!PROVIDERS[a.name]) {
               diags.push({
                 severity: 'error',
@@ -309,7 +482,25 @@ function loadModule(files: Record<string, string>, ctx: LoadCtx, prefix: string,
               line: b.line,
             });
           }
-          cfg.providers.push({ name: b.labels[0], body: b.body, file, line: b.line });
+          const aliasAttr = attr('alias');
+          const alias = literalString(aliasAttr?.expr);
+          if (aliasAttr && (alias === undefined || !NAME_RE.test(alias))) {
+            diags.push({ severity: 'error', summary: 'Invalid provider configuration alias', detail: 'An alias must be a valid name.', hint: 'alias es un texto fijo, p.ej. alias = "virginia".', file, line: aliasAttr.line });
+            break;
+          }
+          const dup = cfg.providers.find((p) => p.name === b.labels[0] && p.alias === alias);
+          if (dup) {
+            diags.push({
+              severity: 'error',
+              summary: 'Duplicate provider configuration',
+              detail: alias ? `A provider configuration for "${b.labels[0]}" with alias "${alias}" was already given at ${dup.file}:${dup.line}.` : `A default (non-aliased) provider configuration for "${b.labels[0]}" was already given at ${dup.file}:${dup.line}.`,
+              hint: alias ? 'Cada alias debe ser único.' : `Solo puede haber un provider "${b.labels[0]}" sin alias. Para usar otra región, añade alias = "nombre" al segundo y apúntalo con provider = ${b.labels[0]}.nombre.`,
+              file,
+              line: b.line,
+            });
+            break;
+          }
+          cfg.providers.push({ name: b.labels[0], alias, body: b.body, file, line: b.line });
           break;
         }
         case 'variable': {
@@ -319,10 +510,10 @@ function loadModule(files: Record<string, string>, ctx: LoadCtx, prefix: string,
             diags.push({ severity: 'error', summary: 'Duplicate variable declaration', detail: `A variable named "${name}" was already declared.`, hint: 'Cada variable solo puede declararse una vez.', file, line: b.line });
             break;
           }
-          const allowed = new Set(['default', 'type', 'description', 'sensitive', 'nullable']);
+          const allowed = new Set(['default', 'type', 'description', 'sensitive', 'nullable', 'ephemeral']);
           for (const a of b.body.attributes) {
             if (!allowed.has(a.name))
-              diags.push({ severity: 'error', summary: 'Unsupported argument', detail: `An argument named "${a.name}" is not expected here.`, hint: 'Un bloque variable admite: type, default, description, sensitive y bloques validation.', file, line: a.line });
+              diags.push({ severity: 'error', summary: 'Unsupported argument', detail: `An argument named "${a.name}" is not expected here.`, hint: 'Un bloque variable admite: type, default, description, sensitive, nullable, ephemeral y bloques validation.', file, line: a.line });
           }
           const validations = b.body.blocks
             .filter((x) => x.type === 'validation')
@@ -336,7 +527,8 @@ function loadModule(files: Record<string, string>, ctx: LoadCtx, prefix: string,
             type: attr('type')?.expr,
             default: attr('default')?.expr,
             description: literalString(attr('description')?.expr),
-            sensitive: attr('sensitive')?.expr.kind === 'literal' && (attr('sensitive')!.expr as { value: unknown }).value === true,
+            sensitive: litTrue(attr('sensitive')?.expr),
+            ephemeral: litTrue(attr('ephemeral')?.expr),
             validations,
             file,
             line: b.line,
@@ -365,11 +557,19 @@ function loadModule(files: Record<string, string>, ctx: LoadCtx, prefix: string,
             diags.push({ severity: 'error', summary: 'Duplicate output definition', detail: `An output named "${name}" was already defined.`, file, line: b.line });
             break;
           }
+          for (const a of b.body.attributes)
+            if (!['value', 'description', 'sensitive', 'depends_on', 'ephemeral'].includes(a.name))
+              diags.push({ severity: 'error', summary: 'Unsupported argument', detail: `An argument named "${a.name}" is not expected here.`, hint: 'Un output admite: value, description, sensitive, ephemeral, depends_on y bloques precondition.', file, line: a.line });
+          const ephemeral = litTrue(attr('ephemeral')?.expr);
+          if (ephemeral && !prefix)
+            diags.push({ severity: 'error', summary: 'Ephemeral output not allowed', detail: 'Ephemeral outputs are not allowed in context of a root module.', hint: 'Un output ephemeral solo tiene sentido en un módulo hijo: el raíz guardaría el valor y dejaría de ser efímero.', file, line: attr('ephemeral')!.line });
           cfg.outputs[name] = {
             name,
             value: value.expr,
             description: literalString(attr('description')?.expr),
-            sensitive: attr('sensitive')?.expr.kind === 'literal' && (attr('sensitive')!.expr as { value: unknown }).value === true,
+            sensitive: litTrue(attr('sensitive')?.expr),
+            ephemeral,
+            preconditions: conditionsOf(b.body, 'precondition', file, diags),
             file,
             line: b.line,
           };
@@ -428,6 +628,15 @@ function loadModule(files: Record<string, string>, ctx: LoadCtx, prefix: string,
           };
           const ignore = lc?.body.attributes.find((a) => a.name === 'ignore_changes')?.expr;
           validateArgs(b.body, schema.args, `El recurso "${type}"`, file, diags, true, b.line);
+          let provider = prov;
+          const provAttr = attr('provider');
+          if (provAttr) {
+            const ref = traversalToAddr(provAttr.expr) ?? (provAttr.expr.kind === 'variable' ? provAttr.expr.name : undefined);
+            const [pname] = (ref ?? '').split('.');
+            if (!ref) diags.push({ severity: 'error', summary: 'Invalid provider reference', detail: 'Provider argument requires a provider name followed by an optional alias, like "aws.foo".', hint: 'Sin comillas: provider = aws.virginia', file, line: provAttr.line });
+            else if (pname !== prov) diags.push({ severity: 'error', summary: 'Invalid provider reference', detail: `Resource type "${type}" belongs to provider "${prov}", not "${pname}".`, hint: `Un recurso ${type} solo puede usar una configuración del proveedor ${prov}.`, file, line: provAttr.line });
+            else provider = ref;
+          }
           cfg.resources[addr] = {
             mode,
             type,
@@ -445,9 +654,41 @@ function loadModule(files: Record<string, string>, ctx: LoadCtx, prefix: string,
                   ? ignore.items.map((i) => (i.kind === 'variable' ? i.name : '')).filter(Boolean)
                   : [],
             },
+            provider,
+            preconditions: lc ? conditionsOf(lc.body, 'precondition', file, diags) : [],
+            postconditions: lc ? conditionsOf(lc.body, 'postcondition', file, diags) : [],
             file,
             line: b.line,
           };
+          break;
+        }
+        case 'moved': {
+          const fromAttr = attr('from');
+          const toAttr = attr('to');
+          if (!fromAttr || !toAttr) {
+            diags.push({ severity: 'error', summary: 'Missing required argument', detail: `The argument "${!fromAttr ? 'from' : 'to'}" is required, but no definition was found.`, hint: 'moved { from = aws_instance.viejo  to = aws_instance.nuevo }', file, line: b.line });
+            break;
+          }
+          const from = movedAddr(fromAttr.expr);
+          const to = movedAddr(toAttr.expr);
+          if (!from || !to) {
+            diags.push({ severity: 'error', summary: 'Invalid "moved" address', detail: 'Expected a resource or module address.', hint: 'from y to son direcciones sin comillas: aws_instance.web, aws_instance.web[0] o module.red.', file, line: (from ? toAttr : fromAttr).line });
+            break;
+          }
+          if (from.startsWith('module.') !== to.startsWith('module.') || (from.split('.')[0] !== to.split('.')[0] && !from.startsWith('module.'))) {
+            diags.push({ severity: 'error', summary: 'Invalid "moved" addresses', detail: `Cannot move ${from} to ${to}: the resource types must match.`, hint: 'Un moved solo puede renombrar: el tipo de recurso no puede cambiar.', file, line: b.line });
+            break;
+          }
+          cfg.moved.push({ from: prefix + from, to: prefix + to, file, line: b.line });
+          break;
+        }
+        case 'check': {
+          if (!need(1, 'check "nombre" { assert { condition = ...  error_message = "..." } }')) break;
+          const asserts = conditionsOf(b.body, 'assert', file, diags);
+          if (!asserts.length) diags.push({ severity: 'error', summary: 'Missing required block', detail: 'A check block must contain at least one assert block.', hint: 'Añade assert { condition = ...  error_message = "..." }', file, line: b.line });
+          if (b.body.blocks.some((x) => x.type === 'data'))
+            diags.push({ severity: 'warning', summary: 'Scoped data sources not simulated', detail: 'El simulador ignora los data sources declarados dentro de un check.', hint: 'En Terraform real, un data dentro de check solo se usa en sus assert y sus errores son avisos.', file, line: b.line });
+          cfg.checks.push({ name: b.labels[0], asserts, file, line: b.line });
           break;
         }
         case 'module': {
@@ -497,13 +738,40 @@ function loadModule(files: Record<string, string>, ctx: LoadCtx, prefix: string,
           }
           break;
         }
+        case 'import': {
+          if (b.labels.length) {
+            diags.push({ severity: 'error', summary: 'Extraneous label for import', detail: 'No labels are expected for import blocks.', hint: 'El bloque import no lleva nombre: import { to = ...  id = "..." }', file, line: b.line });
+            break;
+          }
+          if (prefix) {
+            diags.push({ severity: 'error', summary: 'Invalid import configuration', detail: 'An import block was detected in a module. Import blocks are only allowed in the root module.', hint: 'Los bloques import solo pueden ir en el módulo raíz. Para importar un recurso de un módulo usa to = module.<nombre>.<tipo>.<nombre>.', file, line: b.line });
+            break;
+          }
+          const toAttr = attr('to');
+          const idAttr = attr('id');
+          if (!toAttr || !idAttr) {
+            diags.push({ severity: 'error', summary: 'Missing required argument', detail: `The argument "${!toAttr ? 'to' : 'id'}" is required, but no definition was found.`, hint: 'Un bloque import necesita to (la dirección del recurso en tu código) e id (el identificador del objeto en la nube).', file, line: b.line });
+            break;
+          }
+          const target = exprToInstanceAddr(toAttr.expr);
+          if (!target) {
+            diags.push({ severity: 'error', summary: 'Invalid import address', detail: 'The "to" argument must be a resource instance address.', hint: 'to es una referencia sin comillas: to = aws_s3_bucket.logs', file, line: toAttr.line });
+            break;
+          }
+          if (cfg.imports.some((i) => i.to === target.to)) {
+            diags.push({ severity: 'error', summary: 'Duplicate import configuration', detail: `An import block for the resource "${target.to}" was already declared.`, hint: 'Cada recurso solo se puede importar una vez.', file, line: b.line });
+            break;
+          }
+          cfg.imports.push({ ...target, id: idAttr.expr, file, line: b.line });
+          break;
+        }
         default: {
-          const s = suggest(b.type, ['resource', 'variable', 'output', 'locals', 'provider', 'terraform', 'data', 'module']);
+          const s = suggest(b.type, ['resource', 'variable', 'output', 'locals', 'provider', 'terraform', 'data', 'module', 'import', 'moved', 'check']);
           diags.push({
             severity: 'error',
             summary: 'Unsupported block type',
             detail: `Blocks of type "${b.type}" are not expected here.${s ? ` Did you mean "${s}"?` : ''}`,
-            hint: s ? `¿Querías escribir "${s}"?` : 'Bloques válidos: terraform, provider, resource, data, variable, locals, output, module.',
+            hint: s ? `¿Querías escribir "${s}"?` : 'Bloques válidos: terraform, provider, resource, data, variable, locals, output, module, import, moved, check.',
             file,
             line: b.line,
           });
@@ -641,4 +909,115 @@ export function requiredProviderNames(cfg: Config): string[] {
     for (const r of Object.values(c.resources)) names.add(providerOf(r.type));
   }
   return [...names].filter((n) => PROVIDERS[n]).sort();
+}
+
+const litTrue = (e: Expr | undefined) => !!e && e.kind === 'literal' && e.value === true;
+
+function conditionsOf(body: Body, kind: string, file: string, diags: Diagnostic[]): Condition[] {
+  const out: Condition[] = [];
+  for (const b of body.blocks.filter((x) => x.type === kind)) {
+    const cond = b.body.attributes.find((a) => a.name === 'condition');
+    const msg = b.body.attributes.find((a) => a.name === 'error_message');
+    if (!cond || !msg) {
+      diags.push({ severity: 'error', summary: 'Missing required argument', detail: `The argument "${!cond ? 'condition' : 'error_message'}" is required, but no definition was found.`, hint: `Un bloque ${kind} necesita condition (expresión booleana) y error_message.`, file, line: b.line });
+      continue;
+    }
+    out.push({ condition: cond.expr, errorMessage: msg.expr, file, line: b.line });
+  }
+  return out;
+}
+
+/** Dirección de un moved: aws_instance.web, aws_instance.web[0], module.red */
+function movedAddr(e: Expr): string | undefined {
+  const t = exprToInstanceAddr(e);
+  if (t) return t.to;
+  const parts: string[] = [];
+  let cur: Expr = e;
+  while (cur.kind === 'getattr') {
+    parts.unshift(cur.name);
+    cur = cur.target;
+  }
+  if (cur.kind !== 'variable') return undefined;
+  parts.unshift(cur.name);
+  if (parts.length % 2 === 0 && parts.every((p, i) => (i % 2 === 0 ? p === 'module' : true))) return parts.join('.');
+  return undefined;
+}
+
+const BACKENDS: Record<string, string[]> = {
+  local: [],
+  s3: ['bucket', 'key', 'region'],
+  azurerm: ['storage_account_name', 'container_name', 'key'],
+  gcs: ['bucket'],
+  consul: [],
+  pg: [],
+  http: ['address'],
+  kubernetes: ['secret_suffix'],
+  remote: [],
+};
+
+function parseTerraformBlock(b: { body: Body; line: number }, cfg: Config, file: string, diags: Diagnostic[], isRoot: boolean) {
+  const rv = b.body.attributes.find((a) => a.name === 'required_version');
+  if (rv) {
+    const c = literalString(rv.expr);
+    if (c === undefined || !isValidConstraint(c)) diags.push({ severity: 'error', summary: 'Invalid required_version constraint', detail: 'required_version must be a version constraint string.', hint: 'Ejemplo: required_version = ">= 1.5.0"', file, line: rv.line });
+    else {
+      cfg.requiredVersion = { constraint: c, file, line: rv.line };
+      if (!satisfies(TF_VERSION, c))
+        diags.push({
+          severity: 'error',
+          summary: 'Unsupported Terraform Core version',
+          detail: `This configuration does not support Terraform version ${TF_VERSION}. To proceed, either choose another supported Terraform version or update this version constraint. Version constraints are normally set for good reason, so updating the constraint may lead to other errors or unexpected behavior.`,
+          hint: `El simulador es Terraform ${TF_VERSION} y la configuración pide "${c}". required_version protege de usar una versión de Terraform con la que el código no se ha probado.`,
+          file,
+          line: rv.line,
+        });
+    }
+  }
+  const backends = b.body.blocks.filter((x) => x.type === 'backend');
+  const cloud = b.body.blocks.find((x) => x.type === 'cloud');
+  if ((backends.length || cloud) && !isRoot) {
+    diags.push({ severity: 'warning', summary: 'Backend configuration ignored', detail: 'Any selected backend applies to the entire configuration, so Terraform expects provider configurations only in the root module.', hint: 'El backend solo se configura en el módulo raíz: en un módulo hijo se ignora.', file, line: (backends[0] ?? cloud)!.line });
+    return;
+  }
+  if (backends.length > 1) diags.push({ severity: 'error', summary: 'Duplicate backend configuration', detail: 'A module may have only one backend configuration.', file, line: backends[1].line });
+  if (backends.length && cloud) {
+    diags.push({ severity: 'error', summary: 'Both a backend and HCP Terraform configuration are present', detail: 'A module may declare either one \'cloud\' block or one \'backend\' block configuring a state backend.', hint: 'Usa backend "…" o cloud { … }, no los dos.', file, line: cloud.line });
+    return;
+  }
+  const be = backends[0];
+  if (be) {
+    const type = be.labels[0];
+    if (!type || !(type in BACKENDS)) {
+      diags.push({ severity: 'error', summary: 'Unsupported backend type', detail: `There is no backend type named "${type ?? ''}".`, hint: `Tipos disponibles: ${Object.keys(BACKENDS).join(', ')}.`, file, line: be.line });
+      return;
+    }
+    const attrs: Record<string, Value> = {};
+    for (const a of be.body.attributes) {
+      if (a.expr.kind !== 'literal') {
+        diags.push({ severity: 'error', summary: 'Variables not allowed', detail: 'Variables may not be used here.', hint: 'La configuración del backend se lee en terraform init, antes de evaluar variables: solo admite valores fijos (o -backend-config).', file, line: a.line });
+        continue;
+      }
+      attrs[a.name] = a.expr.value as Value;
+    }
+    for (const req of BACKENDS[type]) if (!(req in attrs)) diags.push({ severity: 'error', summary: 'Missing required argument', detail: `The argument "${req}" is required, but no definition was found.`, hint: `El backend "${type}" necesita: ${BACKENDS[type].join(', ')}.`, file, line: be.line });
+    cfg.backend = { type, attrs, file, line: be.line };
+  }
+  if (cloud) {
+    const ws = cloud.body.blocks.find((x) => x.type === 'workspaces');
+    const lit = (body: Body | undefined, n: string) => literalString(body?.attributes.find((a) => a.name === n)?.expr);
+    const tagsExpr = ws?.body.attributes.find((a) => a.name === 'tags')?.expr;
+    const tags = tagsExpr?.kind === 'tuple' ? tagsExpr.items.map((i) => literalString(i)).filter((x): x is string => !!x) : undefined;
+    const c: CloudBlockConfig = {
+      organization: lit(cloud.body, 'organization'),
+      hostname: lit(cloud.body, 'hostname') ?? 'app.terraform.io',
+      workspaceName: lit(ws?.body, 'name'),
+      workspaceTags: tags,
+      project: lit(ws?.body, 'project'),
+      file,
+      line: cloud.line,
+    };
+    if (!c.organization) diags.push({ severity: 'error', summary: 'Invalid or missing required argument', detail: '"organization" must be set in the cloud configuration or as an environment variable: TF_CLOUD_ORGANIZATION.', hint: 'cloud { organization = "mi-empresa"  workspaces { name = "red-prod" } }', file, line: cloud.line });
+    if (!ws || (!c.workspaceName && !c.workspaceTags)) diags.push({ severity: 'error', summary: 'Invalid workspaces configuration', detail: 'Missing workspace mapping strategy. Either workspace "tags" or "name" is required.', hint: 'Dentro de cloud añade workspaces { name = "…" } (un workspace) o workspaces { tags = ["…"] } (varios).', file, line: cloud.line });
+    cfg.cloud = c;
+  }
 }

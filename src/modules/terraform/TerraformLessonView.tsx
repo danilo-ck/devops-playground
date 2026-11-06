@@ -172,9 +172,10 @@ export function TerraformLessonView({ moduleId, lessonId }: LessonViewProps) {
               {t.id === 'state' && Object.keys(ws.state.resources).length > 0 && <span className="badge badge-dim">{Object.keys(ws.state.resources).length}</span>}
             </button>
           ))}
+          <SessionChips workspace={ws.workspace} backend={ws.backend} lock={!!ws.lock} env={ws.env} />
         </nav>
         <div className="viz-body">
-          {tab === 'infra' && <CloudCanvas state={ws.displayState} plan={ws.planStale ? null : ws.lastPlan?.ok ? ws.lastPlan : null} active={ws.active} busy={ws.busy} />}
+          {tab === 'infra' && <CloudCanvas state={ws.displayState} plan={ws.planStale ? null : ws.lastPlan?.ok ? ws.lastPlan : null} active={ws.active} busy={ws.busy} cloud={ws.cloud} />}
           {tab === 'graph' && <ResourceGraph graph={ws.analysis.graph} plan={!ws.planStale && ws.lastPlan?.ok && !ws.busy ? ws.lastPlan : null} state={ws.displayState} active={ws.active} />}
           {tab === 'plan' && <PlanView plan={ws.lastPlan} stale={ws.planStale} />}
           {tab === 'state' && <StateView state={ws.displayState} />}
@@ -226,6 +227,21 @@ function ProblemsBar({ diagnostics, onJump }: { diagnostics: import('./engine').
           ))}
         </ul>
       )}
+    </div>
+  );
+}
+
+/** Contexto de la sesión: workspace, dónde vive el estado, bloqueo y TF_LOG. */
+function SessionChips({ workspace, backend, lock, env }: { workspace: string; backend: string; lock: boolean; env: Record<string, string> }) {
+  const type = backend.split(':')[0];
+  const where = type === 'cloud' ? 'HCP' : type;
+  const path = backend.slice(type.length + 1);
+  return (
+    <div className="session-chips">
+      {workspace !== 'default' && <span className="schip schip-ws" title="Workspace activo (terraform workspace show)">⎇ {workspace}</span>}
+      {backend !== 'local' && <span className="schip schip-be" title={`El estado se guarda en ${where}: ${path}`}>🗄 {where}</span>}
+      {lock && <span className="schip schip-lock" title="Otra persona tiene bloqueado el estado">🔒</span>}
+      {env.TF_LOG && <span className="schip schip-log" title={`Logs detallados activados: TF_LOG=${env.TF_LOG}`}>log {env.TF_LOG.toLowerCase()}</span>}
     </div>
   );
 }

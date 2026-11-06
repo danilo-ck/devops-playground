@@ -73,7 +73,7 @@ terraform {
 | \`terraform destroy\` | Destruir todo lo gestionado |
 
 > [!WARNING]
-> Tras un \`state rm\`, Terraform ya no conoce el recurso: si sigue en tu código, el próximo plan querrá **crearlo de nuevo** (y en la nube real tendrías un duplicado).`,
+> Tras un \`state rm\`, Terraform ya no conoce el recurso: si sigue en tu código, el próximo plan querrá **crearlo de nuevo** (y en la nube real tendrías un duplicado). Compruébalo con \`cloud ls\`: el objeto sigue ahí, ahora *fuera de Terraform*. En la lección siguiente verás cómo recuperarlo con **import**.`,
   files: { 'main.tf': base },
   objectives: [
     { id: 'list', label: 'Lista los recursos con `terraform state list`', check: (c) => ran(c, 'state list') },

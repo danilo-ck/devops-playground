@@ -123,9 +123,106 @@ export function exprRefs(e: Expr, bound: Set<string> = new Set(), out: Ref[] = [
   }
 }
 
-export function bodyRefs(body: Body, out: Ref[] = []): Ref[] {
-  for (const a of body.attributes) if (a.name !== 'depends_on') exprRefs(a.expr, new Set(), out);
-  for (const b of body.blocks) if (b.type !== 'lifecycle') bodyRefs(b.body, out);
+export function bodyRefs(body: Body, out: Ref[] = [], bound: Set<string> = new Set()): Ref[] {
+  for (const a of body.attributes) if (a.name !== 'depends_on' && a.name !== 'provider') exprRefs(a.expr, bound, out);
+  for (const b of body.blocks) {
+    if (b.type === 'lifecycle') continue;
+    if (b.type === 'dynamic') {
+      // dynamic "ingress" { for_each = ...  content { ... ingress.value ... } }
+      const it = b.body.attributes.find((a) => a.name === 'iterator')?.expr;
+      const name = it?.kind === 'variable' ? it.name : b.labels[0];
+      const fe = b.body.attributes.find((a) => a.name === 'for_each');
+      if (fe) exprRefs(fe.expr, bound, out);
+      const inner = new Set(bound);
+      if (name) inner.add(name);
+      for (const c of b.body.blocks) bodyRefs(c.body, out, inner);
+      continue;
+    }
+    bodyRefs(b.body, out, bound);
+  }
+  return out;
+}
+
+/** Referencias de las condiciones (precondition / postcondition / assert). */
+export function conditionRefs(conds: { condition: Expr; errorMessage: Expr }[], out: Ref[] = []): Ref[] {
+  for (const c of conds) {
+    exprRefs(c.condition, new Set(), out);
+    exprRefs(c.errorMessage, new Set(), out);
+  }
+  return out;
+}
+
+/** Recorre las referencias completas (raíz + atributos) de una expresión: var.x, aws_db.main.password… */
+export function exprPaths(e: Expr, out: string[][] = []): string[][] {
+  const visit = (x: Expr): void => {
+    switch (x.kind) {
+      case 'getattr':
+      case 'index':
+      case 'splat': {
+        const names: string[] = [];
+        let cur: Expr = x;
+        for (;;) {
+          if (cur.kind === 'getattr') {
+            names.unshift(cur.name);
+            cur = cur.target;
+          } else if (cur.kind === 'index') {
+            visit(cur.key);
+            cur = cur.target;
+          } else if (cur.kind === 'splat') {
+            cur = cur.target;
+          } else break;
+        }
+        if (cur.kind === 'variable') out.push([cur.name, ...names]);
+        else visit(cur);
+        if (x.kind === 'splat') {
+          const chainNames: string[] = [];
+          let c: Expr = x.chain;
+          while (c.kind === 'getattr') {
+            chainNames.unshift(c.name);
+            c = c.target;
+          }
+          if (out.length && cur.kind === 'variable') out[out.length - 1].push(...chainNames);
+        }
+        return;
+      }
+      case 'variable':
+        out.push([x.name]);
+        return;
+      case 'template':
+        x.parts.forEach((p) => typeof p !== 'string' && visit(p));
+        return;
+      case 'call':
+        x.args.forEach(visit);
+        return;
+      case 'unary':
+        visit(x.operand);
+        return;
+      case 'binary':
+        visit(x.left);
+        visit(x.right);
+        return;
+      case 'conditional':
+        visit(x.cond);
+        visit(x.then);
+        visit(x.else);
+        return;
+      case 'tuple':
+        x.items.forEach(visit);
+        return;
+      case 'object':
+        x.items.forEach((i) => (visit(i.key), visit(i.value)));
+        return;
+      case 'for':
+        visit(x.coll);
+        if (x.keyExpr) visit(x.keyExpr);
+        visit(x.valExpr);
+        if (x.cond) visit(x.cond);
+        return;
+      default:
+        return;
+    }
+  };
+  visit(e);
   return out;
 }
 
@@ -253,8 +350,10 @@ export function buildGraph(root: Config): DepGraph {
   // Todo recurso depende de la configuración de su proveedor (p.ej. region = var.region),
   // que se declara en el módulo raíz y la heredan los hijos.
   const providerDeps: Record<string, string[]> = {};
-  for (const p of root.providers)
-    providerDeps[p.name] = [...(providerDeps[p.name] ?? []), ...bodyRefs(p.body).flatMap((r) => resolve('', r.ref, r.line, p.file, `provider.${p.name}`))];
+  for (const p of root.providers) {
+    const key = p.alias ? `${p.name}.${p.alias}` : p.name;
+    providerDeps[key] = [...(providerDeps[key] ?? []), ...bodyRefs(p.body).flatMap((r) => resolve('', r.ref, r.line, p.file, `provider.${key}`))];
+  }
 
   const visit =(cfg: Config, inherited: string[]) => {
     const prefix = cfg.prefix;
@@ -263,9 +362,10 @@ export function buildGraph(root: Config): DepGraph {
     for (const r of Object.values(cfg.resources)) {
       const refs = bodyRefs(r.body);
       for (const d of r.dependsOn) refs.push({ ref: d, line: r.line });
-      setDeps(prefix + r.addr, prefix, refs, r.file, [...inherited, ...(providerDeps[providerOf(r.type)] ?? [])]);
+      conditionRefs([...r.preconditions, ...r.postconditions], refs);
+      setDeps(prefix + r.addr, prefix, refs, r.file, [...inherited, ...(providerDeps[r.provider] ?? providerDeps[providerOf(r.type)] ?? [])]);
     }
-    for (const o of Object.values(cfg.outputs)) setDeps(`${prefix}output.${o.name}`, prefix, exprRefs(o.value), o.file);
+    for (const o of Object.values(cfg.outputs)) setDeps(`${prefix}output.${o.name}`, prefix, conditionRefs(o.preconditions, exprRefs(o.value)), o.file);
     for (const call of Object.values(cfg.moduleCalls)) {
       const child = cfg.children[call.name];
       if (!child) continue;
@@ -278,6 +378,8 @@ export function buildGraph(root: Config): DepGraph {
     }
   };
   visit(root, []);
+  // Los check no son nodos del grafo (se evalúan al final), pero sus referencias deben existir.
+  for (const c of root.checks) for (const r of conditionRefs(c.asserts)) resolve('', r.ref, r.line, c.file, `check.${c.name}`);
 
   // Orden topológico (Kahn) determinista.
   const indeg: Record<string, number> = {};

@@ -1,5 +1,5 @@
 import type { LessonMeta, Objective } from '@/core/types';
-import type { Config, DepGraph, HistoryEntry, InstanceState, TfState } from '../engine';
+import type { CloudChanges, Config, DepGraph, HistoryEntry, InstanceState, Policy, StateLock, TfState } from '../engine';
 
 /** Contexto con el que se evalúan los objetivos de una lección de Terraform. */
 export interface TfLessonContext {
@@ -9,6 +9,13 @@ export interface TfLessonContext {
   initialized: string[];
   config: Config;
   graph: DepGraph | null;
+  /** Cambios hechos fuera de Terraform que siguen pendientes. */
+  cloud: CloudChanges;
+  env?: Record<string, string>;
+  /** Workspace activo y estados del resto de workspaces/backends ("<backend>|<workspace>"). */
+  workspace?: string;
+  stateStore?: Record<string, TfState>;
+  lock?: StateLock | null;
 }
 
 export type VizTab = 'infra' | 'graph' | 'plan' | 'state' | 'docs';
@@ -20,6 +27,15 @@ export interface TerraformLesson extends LessonMeta {
   files: Record<string, string>;
   /** Si existe, se aplica al empezar: la lección parte de infraestructura ya creada. */
   setup?: Record<string, string>;
+  /**
+   * Cambios hechos fuera de Terraform al empezar (sobre la infraestructura del setup):
+   * modify: { "aws_instance.web": ["instance_type=t3.large"] }, delete: [dirección], create: [{ type, args }].
+   */
+  drift?: { modify?: Record<string, string[]>; delete?: string[]; create?: { type: string; args: string[] }[] };
+  /** Versiones de proveedor ya fijadas en .terraform.lock.hcl al empezar (p.ej. { aws: '4.67.0' }). */
+  locks?: Record<string, string>;
+  /** Políticas de HCP Terraform de la organización (por defecto, las de ejemplo). */
+  policies?: Policy[];
   objectives: Objective<TfLessonContext>[];
   hints: string[];
   solution?: Record<string, string>;

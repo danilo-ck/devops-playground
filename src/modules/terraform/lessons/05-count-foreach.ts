@@ -61,14 +61,14 @@ Direcciones: \`aws_s3_bucket.datos["logs"]\`, \`aws_s3_bucket.datos["backups"]\`
 
 resource "aws_vpc" "main" {
   cidr_block = "10.0.0.0/16"
-  tags = { Name = "red-apps" }
+  tags       = { Name = "red-apps" }
 }
 
 resource "aws_subnet" "apps" {
   vpc_id            = aws_vpc.main.id
   cidr_block        = "10.0.1.0/24"
   availability_zone = "eu-west-1a"
-  tags = { Name = "apps" }
+  tags              = { Name = "apps" }
 }
 
 # ✏️ Convierte este servidor en 3 usando count
@@ -118,14 +118,14 @@ resource "aws_instance" "web" {
 
 resource "aws_vpc" "main" {
   cidr_block = "10.0.0.0/16"
-  tags = { Name = "red-apps" }
+  tags       = { Name = "red-apps" }
 }
 
 resource "aws_subnet" "apps" {
   vpc_id            = aws_vpc.main.id
   cidr_block        = "10.0.1.0/24"
   availability_zone = "eu-west-1a"
-  tags = { Name = "apps" }
+  tags              = { Name = "apps" }
 }
 
 resource "aws_instance" "web" {

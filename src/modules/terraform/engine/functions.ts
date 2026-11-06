@@ -93,6 +93,10 @@ function format(fmt: string, args: Value[]): string {
 
 export const FUNCTIONS: Record<string, { fn: Fn; signature: string; description: string }> = {
   upper: { signature: 'upper(string)', description: 'Convierte a mayúsculas', fn: ([s]) => str(s, 'upper').toUpperCase() },
+  startswith: { signature: 'startswith(string, prefijo)', description: '¿Empieza el texto por el prefijo?', fn: ([s, p]) => str(s, 'startswith').startsWith(str(p, 'startswith')) },
+  endswith: { signature: 'endswith(string, sufijo)', description: '¿Termina el texto por el sufijo?', fn: ([s, p]) => str(s, 'endswith').endsWith(str(p, 'endswith')) },
+  sensitive: { signature: 'sensitive(valor)', description: 'Marca un valor como sensible (se oculta en plan y outputs)', fn: ([v]) => v },
+  nonsensitive: { signature: 'nonsensitive(valor)', description: 'Quita la marca de sensible (úsalo solo si de verdad no es secreto)', fn: ([v]) => v },
   lower: { signature: 'lower(string)', description: 'Convierte a minúsculas', fn: ([s]) => str(s, 'lower').toLowerCase() },
   title: {
     signature: 'title(string)',

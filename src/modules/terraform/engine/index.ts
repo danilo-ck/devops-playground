@@ -11,3 +11,7 @@ export { FUNCTIONS } from './functions';
 export { parseHcl } from './parser';
 export { REGISTRY, satisfies, resolveVersion, compareVersions } from './registry';
 export type { RegistryModule } from './registry';
+export * from './cloud';
+export * from './fmt';
+export * from './hcp';
+export { TF_VERSION, PROVIDER_VERSIONS } from './providers';

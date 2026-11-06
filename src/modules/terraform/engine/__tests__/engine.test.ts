@@ -68,7 +68,7 @@ output "vpc_id" { value = aws_vpc.main.id }`,
   it('planifica creaciones con valores desconocidos', () => {
     const p = plan(files, emptyState());
     expect(p.ok).toBe(true);
-    expect(p.summary).toEqual({ add: 3, change: 0, destroy: 0 });
+    expect(p.summary).toEqual({ add: 3, change: 0, destroy: 0, import: 0 });
     const sub = p.changes.find((c) => c.addr === 'aws_subnet.public[1]')!;
     expect(sub.after!.cidr_block).toBe('10.0.1.0/24');
     expect(isUnknown(sub.after!.vpc_id)).toBe(true);
@@ -177,7 +177,7 @@ describe('CLI', () => {
     const o1 = runCommand('terraform plan', ctx);
     expect(o1.kind === 'lines' && o1.history?.ok).toBe(false);
     const o2 = runCommand('terraform init', ctx);
-    expect(o2.kind === 'lines' && o2.initialized).toEqual(['random']);
+    expect(o2.kind === 'lines' && o2.initialized).toEqual(['random', 'lock:random=3.7.2']);
     const o3 = runCommand('terraform apply', { ...ctx, initialized: ['random'] });
     expect(o3.kind).toBe('confirm');
     const o4 = runCommand('tf apply -auto-approve', { ...ctx, initialized: ['random'] });

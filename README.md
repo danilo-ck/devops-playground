@@ -15,15 +15,17 @@ npm run build      # build de producción en dist/
 
 ## Qué incluye el módulo de Terraform
 
-- **Motor de Terraform simulado** (`src/modules/terraform/engine`): lexer y parser de HCL, validación contra esquemas de proveedor, grafo de dependencias, `plan` / `apply` / `destroy` con valores `(known after apply)`, update in‑place vs replace (incluido el efecto dominó), `count`, `for_each`, `locals`, `data`, `lifecycle`, **módulos** (locales y de un registro simulado `devopslab/…` con versiones semánticas, ámbito propio por módulo, instalación con `terraform init` / `init -upgrade`), variables (`default`, `terraform.tfvars`, `-var`, `validation`), outputs, más de 40 funciones (`cidrsubnet`, `merge`, `format`…), errores de la "API" de la nube durante el apply (con apply parcial) y un estado tipo `terraform.tfstate`.
-- **Terminal** con `init`, `validate`, `plan`, `apply` (pide `yes`), `destroy`, `output`, `state list|show|rm`, `show`, `graph` y `console`. Los errores imitan los de Terraform e incluyen una pista didáctica en español (💡).
+- **Motor de Terraform simulado** (`src/modules/terraform/engine`): lexer y parser de HCL, validación contra esquemas de proveedor, grafo de dependencias, `plan` / `apply` / `destroy` con valores `(known after apply)`, update in‑place vs replace (incluido el efecto dominó), `count`, `for_each`, `locals`, `data`, `lifecycle`, **módulos** (locales y de un registro simulado `devopslab/…` con versiones semánticas, ámbito propio por módulo, instalación con `terraform init` / `init -upgrade`), **drift** (una "nube real" separada del estado: refresh, `-refresh-only`, `-refresh=false`) e **importación** (bloques `import`, `terraform import`, `-generate-config-out`), **proveedores** con versiones, `.terraform.lock.hcl`, `required_version` y `alias` multirregión, variables (precedencia completa: `default`, `TF_VAR_`, `terraform.tfvars`, `*.auto.tfvars`, `-var-file`, `-var`; `validation`, `sensitive`, `ephemeral`), argumentos write-only, bloques `dynamic`, `precondition` / `postcondition` / `check`, `moved`, `-replace` / `taint`, **backends** (local, s3, azurerm, gcs… con `-migrate-state` / `-reconfigure`), **bloqueo del estado**, **workspaces**, **HCP Terraform** (bloque `cloud`, ejecuciones remotas, estimación de costes y políticas advisory / soft / hard-mandatory), outputs, más de 40 funciones (`cidrsubnet`, `merge`, `format`…), errores de la "API" de la nube durante el apply (con apply parcial) y un estado tipo `terraform.tfstate`.
+- **Terminal** con `init` (`-upgrade`, `-migrate-state`, `-reconfigure`), `validate`, `fmt` (`-check`, `-diff`, `-recursive`), `plan` (`-out`, `-refresh-only`, `-replace`, `-var-file`, `-generate-config-out`), `apply` (pide `yes`, o aplica un plan guardado), `destroy`, `output` (`-json`, `-raw`), `state list|show|mv|rm|pull`, `import`, `taint`/`untaint`, `workspace`, `providers`, `force-unlock`, `login`, `show`, `graph`, `console` y `refresh` (obsoleto). Admite variables de entorno (`export TF_LOG=DEBUG`, `TF_LOG_PATH`, `TF_VAR_…`). Para simular lo que pasa fuera de Terraform: `cloud ls|modify|delete|create` (consola web de AWS) y `team apply|crash` (una compañera bloquea el estado remoto). Los errores imitan los de Terraform e incluyen una pista didáctica en español (💡).
 - **Visualizaciones**:
-  - *Infraestructura*: diagrama de la nube (región → VPC → subredes → instancias, IGW, rutas, security groups, servicios). Muestra el plan como borrador (crear / modificar / reemplazar / destruir) y anima el apply recurso a recurso.
+  - *Infraestructura*: diagrama de la nube (una sección por región → VPC → subredes → instancias, IGW, rutas, security groups, servicios). Muestra el plan como borrador (crear / modificar / reemplazar / destruir / importar), marca lo cambiado o creado a mano fuera de Terraform y anima el apply recurso a recurso.
   - *Grafo*: grafo de dependencias en vivo, con el estado de cada nodo.
   - *Plan*: diff visual de atributos, con lo que "fuerza reemplazo".
   - *Estado*: el `terraform.tfstate` en tarjetas o en JSON.
   - *Docs*: referencia de recursos y funciones disponibles.
-- **9 lecciones** con teoría, objetivos que se validan solos, pistas y solución, más un **sandbox** libre. El progreso y el trabajo se guardan en `localStorage`.
+- **16 lecciones** con teoría, objetivos que se validan solos, pistas y solución, más un **sandbox** libre. Cubren los objetivos del examen **Terraform Associate (004)**.
+- **Modo examen** (`/m/terraform/examen`): banco de 120 preguntas propias por objetivo del examen, simulacro de 57 preguntas en 60 minutos, práctica por objetivo con corrección inmediata y repaso de fallos.
+- El progreso, el trabajo de cada lección y los intentos de examen se guardan en `localStorage`.
 
 ## Arquitectura
 
@@ -57,7 +59,7 @@ La home, la navegación, las rutas (`/m/:moduleId/:lessonId`), el progreso y el 
 
 ### Añadir una lección de Terraform
 
-Crea un fichero en `src/modules/terraform/lessons/` exportando un `TerraformLesson` (teoría, ficheros iniciales, `setup` opcional con infraestructura ya desplegada, objetivos, pistas y solución) y añádelo a `lessons/index.ts`. El test `lessons.test.ts` comprueba automáticamente que la solución se aplica y cumple los objetivos.
+Crea un fichero en `src/modules/terraform/lessons/` exportando un `TerraformLesson` (teoría, ficheros iniciales, `setup` opcional con infraestructura ya desplegada, `drift` opcional con cambios hechos a mano sobre ella, `locks` opcional con versiones de proveedor ya fijadas, `policies` opcionales de HCP Terraform, objetivos, pistas y solución) y añádelo a `lessons/index.ts`. El test `lessons.test.ts` comprueba automáticamente que la solución se aplica y cumple los objetivos; para misiones que dependen de comandos interactivos, añade un recorrido completo en `flows.test.ts`.
 
 ### Añadir un módulo al registro simulado
 

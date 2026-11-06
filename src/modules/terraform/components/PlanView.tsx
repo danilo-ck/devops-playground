@@ -33,15 +33,30 @@ export function PlanView({ plan, stale }: { plan: PlanResult | null; stale: bool
       </div>
     );
   }
-  const changes = plan.changes.filter((c) => c.action !== 'noop');
-  const unchanged = plan.changes.filter((c) => c.action === 'noop').length;
+  const changes = plan.changes.filter((c) => c.action !== 'noop' || c.importing || c.movedFrom);
+  const unchanged = plan.changes.filter((c) => c.action === 'noop' && !c.importing && !c.movedFrom).length;
   const outCh = plan.outputChanges.filter((o) => o.action !== 'noop');
 
   return (
     <div className="planview">
       {stale && <div className="banner warn">✏️ Has cambiado el código desde este plan. Vuelve a ejecutar <code>terraform plan</code>.</div>}
       {plan.destroy && <div className="banner danger">💣 Plan de destrucción: se eliminará toda la infraestructura gestionada.</div>}
+      {plan.refreshOnly && (
+        <div className="banner info">
+          🔄 Plan <code>-refresh-only</code>: solo compara el estado con la nube real. No propone cambios en la infraestructura; un <code>apply -refresh-only</code> guardaría en el estado lo que hay en la nube.
+        </div>
+      )}
+      {plan.drift.length > 0 && <DriftList plan={plan} />}
+      {plan.refreshOnly ? (
+        !plan.drift.length && <div className="banner ok">✅ Sin drift: la nube real coincide con el estado.</div>
+      ) : (
+      <>
       <div className="plan-summary">
+        {plan.summary.import > 0 && (
+          <div className="ps ps-import">
+            <strong>{plan.summary.import}</strong> a importar
+          </div>
+        )}
         <div className="ps ps-add">
           <strong>{plan.summary.add}</strong> a crear
         </div>
@@ -61,6 +76,8 @@ export function PlanView({ plan, stale }: { plan: PlanResult | null; stale: bool
           <ChangeCard key={c.addr} c={c} />
         ))}
       </div>
+      </>
+      )}
       {outCh.length > 0 && (
         <div className="plan-outputs">
           <h4>Outputs</h4>
@@ -83,8 +100,45 @@ export function PlanView({ plan, stale }: { plan: PlanResult | null; stale: bool
   );
 }
 
+function DriftList({ plan }: { plan: PlanResult }) {
+  return (
+    <div className="drift-box">
+      <h4>✋ Cambios hechos fuera de Terraform</h4>
+      <p className="muted small">
+        El <strong>refresh</strong> ha leído la nube real y no coincide con el estado.
+        {plan.refreshOnly ? ' Este plan no hará nada para deshacerlos.' : ' El plan de abajo propone volver a lo que dice tu código (salvo lo que ignores con ignore_changes).'}
+      </p>
+      {plan.drift.map((d) => (
+        <div key={d.addr} className="drift-item">
+          <div className="change-head">
+            <ResIcon type={d.type} size={16} />
+            <code>{d.addr}</code>
+            <span className="change-label">{d.action === 'delete' ? 'ya no existe: lo borraron a mano' : 'cambiado a mano'}</span>
+          </div>
+          {d.diffs.length > 0 && (
+            <table className="diff">
+              <tbody>
+                {d.diffs.map((x) => (
+                  <tr key={x.name}>
+                    <td className="diff-k">{x.name}</td>
+                    <td className="diff-before">{fmt(x.before, false)}</td>
+                    <td className="diff-after">→ {fmt(x.after, false)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+const MOVED_NOOP = { sym: '→', label: 'solo cambia de nombre (moved): no se toca el recurso real', cls: 'import' };
+const IMPORT_NOOP = { sym: '⇩', label: 'se importará tal cual (el código coincide con el objeto real)', cls: 'import' };
+
 function ChangeCard({ c }: { c: ResourceChange }) {
-  const a = ACTION[c.action];
+  const a = c.importing && c.action === 'noop' ? IMPORT_NOOP : c.movedFrom && c.action === 'noop' ? MOVED_NOOP : ACTION[c.action];
   const sens = (n: string) => c.sensitiveAttrs.includes(n);
   let rows: { name: string; before?: Value; after?: Value; force?: boolean; kind: 'add' | 'del' | 'chg' }[] = [];
   if (c.action === 'create' || c.action === 'read') {
@@ -104,7 +158,13 @@ function ChangeCard({ c }: { c: ResourceChange }) {
         <ResIcon type={c.type} size={16} />
         <code>{c.addr}</code>
         <span className="change-label">{a.label}</span>
+        {c.importing && c.action !== 'noop' && <span className="import-chip">⇩ importa "{c.importing}"</span>}
       </div>
+      {c.importing && c.action === 'noop' && <div className="change-why">ID en la nube: {c.importing}</div>}
+      {c.movedFrom && <div className="change-why">Antes se llamaba <code>{c.movedFrom}</code> (bloque moved).</div>}
+      {c.reason === 'requested' && <div className="change-why">Reemplazo pedido con <code>-replace</code>, aunque el código no haya cambiado.</div>}
+      {c.reason === 'tainted' && <div className="change-why">Está marcado como <em>tainted</em> en el estado: se recrea.</div>}
+      {c.writeOnlyAttrs?.length ? <div className="change-why">Write-only: <code>{c.writeOnlyAttrs.join(', ')}</code> se envía a la nube pero no queda en el plan ni en el estado.</div> : null}
       {c.action === 'replace' && c.replaceReasons.length > 0 && (
         <div className="change-why">
           Motivo: cambia <strong>{c.replaceReasons.join(', ')}</strong>, que no se puede modificar en caliente.

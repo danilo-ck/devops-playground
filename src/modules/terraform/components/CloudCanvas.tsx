@@ -1,9 +1,11 @@
 import { useMemo, useState, type ReactNode } from 'react';
-import type { PlanResult, TfState, Value, ValueMap } from '../engine';
-import { formatHcl, isMap, isUnknown, RESOURCE_SCHEMAS } from '../engine';
+import type { CloudChanges, PlanResult, TfState, Value, ValueMap } from '../engine';
+import { cloudEntries, formatHcl, isMap, isUnknown, RESOURCE_SCHEMAS } from '../engine';
 import { CATEGORY_COLOR, ResIcon } from './icons';
 
-type ItemStatus = 'live' | 'create' | 'update' | 'replace' | 'delete';
+type ItemStatus = 'live' | 'create' | 'update' | 'replace' | 'delete' | 'import';
+/** Relación con la nube real: cambiado o borrado a mano, o creado sin Terraform. */
+type Drift = 'drifted' | 'deleted' | 'unmanaged';
 
 interface Item {
   addr: string;
@@ -13,6 +15,11 @@ interface Item {
   status: ItemStatus;
   /** module.red si el recurso pertenece a un módulo. */
   module?: string;
+  drift?: Drift;
+  /** Atributos cambiados a mano. */
+  changed?: string[];
+  /** Región de AWS (para recursos planificados que aún no tienen ARN). */
+  region?: string;
 }
 
 interface Props {
@@ -21,6 +28,8 @@ interface Props {
   active: string | null;
   /** true mientras se anima un apply: no se superpone el plan. */
   busy: boolean;
+  /** Cambios hechos fuera de Terraform. */
+  cloud?: CloudChanges;
 }
 
 const STATUS_TEXT: Record<ItemStatus, string> = {
@@ -29,6 +38,13 @@ const STATUS_TEXT: Record<ItemStatus, string> = {
   update: '~ se modificará',
   replace: '-/+ se reemplazará',
   delete: '- se destruirá',
+  import: '⇩ se importará',
+};
+
+const DRIFT_TEXT: Record<Drift, string> = {
+  drifted: '✋ cambiado a mano',
+  deleted: '✖ borrado a mano',
+  unmanaged: '✋ fuera de Terraform',
 };
 
 const str = (v: Value | undefined): string => (v === undefined || v === null ? '' : isUnknown(v) ? '(tras apply)' : typeof v === 'object' ? formatHcl(v) : String(v));
@@ -37,7 +53,7 @@ const nameTag = (it: Item) => {
   return isMap(tags) && typeof tags.Name === 'string' ? tags.Name : null;
 };
 
-export function CloudCanvas({ state, plan, active, busy }: Props) {
+export function CloudCanvas({ state, plan, active, busy, cloud }: Props) {
   const [selected, setSelected] = useState<string | null>(null);
 
   const model = useMemo(() => {
@@ -46,10 +62,24 @@ export function CloudCanvas({ state, plan, active, busy }: Props) {
       if (r.mode !== 'managed') continue;
       items.set(r.addr, { addr: r.addr, type: r.type, name: r.name, attrs: r.attributes, status: 'live', module: r.module });
     }
+    // La nube real: lo que se cambió, borró o creó a mano (Terraform aún no lo sabe).
+    if (cloud && !busy) {
+      for (const e of cloudEntries(state, cloud)) {
+        if (e.status === 'managed') continue;
+        if (e.addr && items.has(e.addr)) items.set(e.addr, { ...items.get(e.addr)!, attrs: e.attributes, drift: e.status as Drift, changed: e.changed });
+        else if (!e.addr) items.set(`cloud:${e.id}`, { addr: `cloud:${e.id}`, type: e.type, name: e.id, attrs: e.attributes, status: 'live', drift: 'unmanaged' });
+      }
+    }
     if (plan && !busy) {
       for (const c of plan.changes) {
+        if (c.importing) {
+          const raw = items.get(`cloud:${c.importing}`);
+          items.delete(`cloud:${c.importing}`);
+          items.set(c.addr, { addr: c.addr, type: c.type, name: c.name, attrs: { ...(raw?.attrs ?? {}), ...(c.after ?? {}) }, status: 'import', module: c.module });
+          continue;
+        }
         if (c.mode !== 'managed' || c.action === 'noop' || c.action === 'read') continue;
-        if (c.action === 'create') items.set(c.addr, { addr: c.addr, type: c.type, name: c.name, attrs: c.after!, status: 'create', module: c.module });
+        if (c.action === 'create') items.set(c.addr, { addr: c.addr, type: c.type, name: c.name, attrs: c.after!, status: 'create', module: c.module, region: c.region });
         else {
           const it = items.get(c.addr);
           if (it) items.set(c.addr, { ...it, status: c.action as ItemStatus, attrs: c.action === 'delete' ? it.attrs : { ...it.attrs, ...(c.after ?? {}) } });
@@ -109,14 +139,32 @@ export function CloudCanvas({ state, plan, active, busy }: Props) {
     services.forEach((i) => placed.add(i.addr));
     const others = all.filter((i) => !placed.has(i.addr));
 
-    const regionArn = all.map((i) => i.attrs.arn).find((a) => typeof a === 'string' && a.split(':')[3]) as string | undefined;
-    const region = (regionArn?.split(':')[3] || (typeof all.find((i) => i.type === 'aws_s3_bucket')?.attrs.region === 'string' && (all.find((i) => i.type === 'aws_s3_bucket')!.attrs.region as string))) || planRegion(plan) || 'us-east-1';
+    // Cada recurso vive en la región de su configuración de proveedor (provider = aws.alias).
+    const fallback = planRegion(plan) || 'us-east-1';
+    const regionOfItem = (i: Item): string => {
+      if (i.region) return i.region;
+      const arn = i.attrs.arn;
+      if (typeof arn === 'string' && arn.split(':')[3]) return arn.split(':')[3];
+      if (typeof i.attrs.region === 'string') return i.attrs.region;
+      if (typeof i.attrs.availability_zone === 'string') return i.attrs.availability_zone.replace(/[a-z]$/, '');
+      return fallback;
+    };
+    type RegionModel = { name: string; vpcModels: typeof vpcModels; looseInstances: Item[]; looseNet: Item[]; services: Item[] };
+    const regionMap = new Map<string, RegionModel>();
+    const bucket = (name: string) => {
+      if (!regionMap.has(name)) regionMap.set(name, { name, vpcModels: [], looseInstances: [], looseNet: [], services: [] });
+      return regionMap.get(name)!;
+    };
+    vpcModels.forEach((v) => bucket(regionOfItem(v.vpc)).vpcModels.push(v));
+    looseInstances.forEach((i) => bucket(regionOfItem(i)).looseInstances.push(i));
+    looseNet.forEach((i) => bucket(regionOfItem(i)).looseNet.push(i));
+    services.forEach((i) => bucket(regionOfItem(i)).services.push(i));
+    const regions = [...regionMap.values()].sort((a, b) => (a.name === fallback ? -1 : b.name === fallback ? 1 : a.name.localeCompare(b.name)));
 
-    return { all, vpcModels, looseInstances, looseNet, services, others, sgNames, region, assocCount: all.filter((i) => i.type === 'aws_route_table_association').length };
-  }, [state, plan, busy]);
+    return { all, regions, others, sgNames, assocCount: all.filter((i) => i.type === 'aws_route_table_association').length };
+  }, [state, plan, busy, cloud]);
 
   const sel = selected ? model.all.find((i) => i.addr === selected) : undefined;
-  const hasAws = model.vpcModels.length + model.looseInstances.length + model.services.length + model.looseNet.length > 0;
 
   if (!model.all.length) {
     return (
@@ -139,14 +187,15 @@ export function CloudCanvas({ state, plan, active, busy }: Props) {
   return (
     <div className="cloud">
       <div className="cloud-scroll">
-        {hasAws && (
-          <section className="region">
+        {model.regions.map((rg) => (
+          <section key={rg.name} className="region">
             <header className="region-head">
-              <span className="aws-badge">aws</span> Región <strong>{model.region}</strong>
+              <span className="aws-badge">aws</span> Región <strong>{rg.name}</strong>
+              {model.regions.length > 1 && <span className="muted small"> · varias regiones: provider con alias</span>}
             </header>
             <div className="region-body">
-              {model.vpcModels.map(({ vpc, subnets, igws, rts, sgs }) => (
-                <div key={vpc.addr} className={`vpc box st-${vpc.status} ${active === vpc.addr ? 'is-active' : ''}`} onClick={(e) => (e.stopPropagation(), setSelected(vpc.addr))}>
+              {rg.vpcModels.map(({ vpc, subnets, igws, rts, sgs }) => (
+                <div key={vpc.addr} className={`vpc box st-${vpc.status} ${driftCls(vpc)} ${active === vpc.addr ? 'is-active' : ''}`} onClick={(e) => (e.stopPropagation(), setSelected(vpc.addr))}>
                   <div className="box-head">
                     <span className="box-icon" style={{ color: CATEGORY_COLOR.network }}>
                       <ResIcon type="aws_vpc" size={16} />
@@ -154,6 +203,7 @@ export function CloudCanvas({ state, plan, active, busy }: Props) {
                     <span className="box-title">VPC {nameTag(vpc) ?? vpc.name}</span>
                     <ModChip module={vpc.module} />
                     <span className="box-cidr">{str(vpc.attrs.cidr_block)}</span>
+                    <DriftTag item={vpc} />
                     <StatusTag status={vpc.status} />
                   </div>
                   {igws.length > 0 && (
@@ -186,13 +236,14 @@ export function CloudCanvas({ state, plan, active, busy }: Props) {
                   )}
                   <div className="subnets">
                     {subnets.map(({ sn, instances, isPublic }) => (
-                      <div key={sn.addr} className={`subnet box st-${sn.status} ${isPublic ? 'is-public' : ''} ${active === sn.addr ? 'is-active' : ''}`} onClick={(e) => (e.stopPropagation(), setSelected(sn.addr))}>
+                      <div key={sn.addr} className={`subnet box st-${sn.status} ${driftCls(sn)} ${isPublic ? 'is-public' : ''} ${active === sn.addr ? 'is-active' : ''}`} onClick={(e) => (e.stopPropagation(), setSelected(sn.addr))}>
                         <div className="box-head">
                           <span className="box-icon" style={{ color: CATEGORY_COLOR.network }}>
                             <ResIcon type="aws_subnet" size={14} />
                           </span>
                           <span className="box-title">{nameTag(sn) ?? sn.name}</span>
                           <ModChip module={sn.module} />
+                          <DriftTag item={sn} />
                           <StatusTag status={sn.status} />
                         </div>
                         <div className="subnet-meta">
@@ -211,28 +262,28 @@ export function CloudCanvas({ state, plan, active, busy }: Props) {
                 </div>
               ))}
 
-              {(model.looseInstances.length > 0 || model.looseNet.length > 0) && (
+              {(rg.looseInstances.length > 0 || rg.looseNet.length > 0) && (
                 <div className="vpc box default-vpc">
                   <div className="box-head">
                     <span className="box-title">VPC por defecto</span>
                     <span className="muted small">recursos sin red explícita</span>
                   </div>
                   <div className="instances">
-                    {model.looseNet.map((i) => card(i))}
-                    {model.looseInstances.map((i) => card(i, <InstanceExtra item={i} sgs={model.sgNames(i)} />))}
+                    {rg.looseNet.map((i) => card(i))}
+                    {rg.looseInstances.map((i) => card(i, <InstanceExtra item={i} sgs={model.sgNames(i)} />))}
                   </div>
                 </div>
               )}
 
-              {model.services.length > 0 && (
+              {rg.services.length > 0 && (
                 <div className="services">
                   <div className="services-title">Servicios regionales</div>
-                  <div className="instances">{model.services.map((i) => card(i, <ServiceExtra item={i} />))}</div>
+                  <div className="instances">{rg.services.map((i) => card(i, <ServiceExtra item={i} />))}</div>
                 </div>
               )}
             </div>
           </section>
-        )}
+        ))}
 
         {model.others.length > 0 && (
           <section className="region region-local">
@@ -256,6 +307,13 @@ export function CloudCanvas({ state, plan, active, busy }: Props) {
             <span className="lg lg-update">~ se modificará</span>
             <span className="lg lg-replace">-/+ se reemplazará</span>
             <span className="lg lg-delete">- se destruirá</span>
+            {model.all.some((i) => i.drift || i.status === 'import') && (
+              <>
+                <span className="lg lg-drift">✋ cambiado fuera de Terraform</span>
+                <span className="lg lg-unmanaged">no gestionado</span>
+                <span className="lg lg-import">⇩ se importará</span>
+              </>
+            )}
             <span className="muted small">Haz clic en un recurso para ver sus atributos</span>
           </div>
         )}
@@ -286,6 +344,19 @@ function ModChip({ module }: { module?: string }) {
   );
 }
 
+function DriftTag({ item }: { item: Item }) {
+  if (!item.drift || item.status === 'import') return null;
+  const what = item.drift === 'drifted' && item.changed?.length ? `: ${item.changed.join(', ')}` : '';
+  return (
+    <span className={`drift-tag dt-${item.drift}`} title="Cambio hecho fuera de Terraform: el estado no lo sabe hasta el próximo refresh">
+      {DRIFT_TEXT[item.drift]}
+      {what}
+    </span>
+  );
+}
+
+const driftCls = (it: Item) => (it.drift && it.status !== 'import' ? `dr-${it.drift}` : '');
+
 function StatusTag({ status }: { status: ItemStatus }) {
   if (status === 'live') return null;
   return <span className={`status-tag stt-${status}`}>{STATUS_TEXT[status]}</span>;
@@ -296,7 +367,7 @@ function ResourceCard({ item, active, selected, onSelect, children, compact }: {
   const color = CATEGORY_COLOR[schema?.category ?? 'utility'];
   return (
     <div
-      className={`rcard st-${item.status} ${active ? 'is-active' : ''} ${selected ? 'is-selected' : ''} ${compact ? 'compact' : ''}`}
+      className={`rcard st-${item.status} ${driftCls(item)} ${active ? 'is-active' : ''} ${selected ? 'is-selected' : ''} ${compact ? 'compact' : ''}`}
       style={{ ['--cat' as string]: color }}
       onClick={(e) => {
         e.stopPropagation();
@@ -312,6 +383,7 @@ function ResourceCard({ item, active, selected, onSelect, children, compact }: {
         <div className="rcard-type">
           {schema?.title ?? item.type} <ModChip module={item.module} />
         </div>
+        <DriftTag item={item} />
         {children}
       </div>
       <StatusTag status={item.status} />
@@ -369,13 +441,21 @@ function Details({ item, onClose }: { item: Item; onClose: () => void }) {
     <div className="details">
       <div className="details-head">
         <ResIcon type={item.type} size={16} />
-        <code>{item.addr}</code>
+        <code>{item.addr.startsWith('cloud:') ? `${item.type} (id ${item.name})` : item.addr}</code>
+        <DriftTag item={item} />
         <StatusTag status={item.status} />
         <button className="link" onClick={onClose}>
           cerrar ✕
         </button>
       </div>
       {schema && <p className="muted small">{schema.description}</p>}
+      {item.drift === 'unmanaged' && item.status !== 'import' && (
+        <p className="small drift-note">✋ Este recurso existe en la nube pero Terraform no lo conoce. Para gestionarlo, impórtalo con un bloque <code>import</code> (id: <code>{item.name}</code>).</p>
+      )}
+      {item.drift === 'drifted' && (
+        <p className="small drift-note">✋ Alguien cambió <strong>{item.changed?.join(', ')}</strong> fuera de Terraform. Se ven los valores reales; el estado aún tiene los antiguos hasta el próximo refresh.</p>
+      )}
+      {item.drift === 'deleted' && <p className="small drift-note">✖ Alguien lo borró a mano. Sigue en el estado, pero ya no existe en la nube.</p>}
       <div className="details-grid">
         {entries.map(([k, v]) => (
           <div key={k} className="dg-row">
@@ -383,7 +463,7 @@ function Details({ item, onClose }: { item: Item; onClose: () => void }) {
               {k}
               {schema?.args[k]?.forceNew && <span title="Cambiar este argumento obliga a reemplazar el recurso" className="fn-mark">⚠</span>}
             </span>
-            <span className={`dg-v ${isUnknown(v) ? 'unknown' : ''}`}>{schema?.args[k]?.sensitive ? '(sensitive)' : isUnknown(v) ? '(known after apply)' : formatHcl(v)}</span>
+            <span className={`dg-v ${isUnknown(v) ? 'unknown' : ''} ${item.changed?.includes(k) ? 'dg-drift' : ''}`}>{schema?.args[k]?.sensitive ? '(sensitive)' : isUnknown(v) ? '(known after apply)' : formatHcl(v)}</span>
           </div>
         ))}
       </div>
